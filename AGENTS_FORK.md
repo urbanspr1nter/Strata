@@ -158,3 +158,81 @@ greedy drafts verified against the sampled distribution, exact) 68.5 / 76.3 tok/
 The greedy request on the same prompt: 79.6 tok/s (62% accepted). The top-k of a sampled request is sorted on
 the device now (a radix sort of the 248,320 logits) instead of copying them to the host every token.
 `STRATA_Q8_PACKED=1` cannot start on one 8 GB card even at 8K context (the staging buffers do not fit).
+
+## 2026-10-16 - end to end: setup with both cards, the server, the repo's benchmark, llama-server
+
+`./setup.sh --yes --family qwen36 --model UD-Q4_K_XL --gpus all --no-start` compiles the engine from this tree
+(incremental), writes `"gpu": [0, 1]` and `"layer_split": "auto"` into `strata-qwen36-ud-q4_k_xl.json` and the run
+script; the server starts it with `CUDA_VISIBLE_DEVICES=0,1 --layer-split auto` and `/health` says loaded.
+
+`tools/strata_bench.py` against the running server (greedy, thinking off, medians of 3):
+
+| test | prompt tok/s | decode tok/s | first token |
+| --- | ---: | ---: | ---: |
+| short chat (46-token prompts, 100 out) | - | 79.4 (67.6-92.1) | 0.25 s |
+| 4K prompt, fresh | 1,263 | - | 3.19 s |
+| 16K prompt, fresh | 1,225 | - | 13.1 s |
+| agent session, turns 1-5 (3.8K -> 14.5K tokens) | 1,102-1,195 | 54 -> 27 | 3.3 -> 13.0 s |
+
+Two weaknesses for agent use came out of it: (1) the engine held no reusable state between turns (0 cached
+tokens: the chat template renders the previous answer differently from the tokens the engine generated, so the
+new prompt is never an exact extension), so every turn re-read the whole conversation; (2) decode fell from 69
+to 27 tok/s as the context grew to 14.5K tokens. (1) is addressed next with checkpoints of the recurrent state;
+(2) is measured next.
+
+The same requests to llama-server with the user's own script's settings (`--spec-type draft-mtp
+--spec-draft-n-max 3 -ngl 999 -fa on -ctk q8_0 -ctv q8_0 --n-cpu-moe 32 -ts 3,1 -c 262144 -t 10`, no mmproj) and to
+the fork's server, through the OpenAI API, the servers' own timings, two runs each:
+
+| request | fork (two cards) | llama-server |
+| --- | ---: | ---: |
+| short chat, prose, temperature 1.0, 100 tokens | 65-72 tok/s | 44-48 tok/s |
+| short chat, code, temperature 1.0 | 84-92 | 57-65 |
+| short chat, greedy | 60-89 | 45-68 |
+| 3,197-token prompt (fresh) | 997-1,018 tok/s | 546 tok/s |
+| decode right after that prompt (24 tokens) | 40-51 | 43 |
+
+llama-server's prompt cache made its repeated prompts free ("prompt 4 tok"); the fork's engine read them again
+every time (point (1) above).
+
+## 2026-10-16 - checkpoints for re-sent conversations; the decode attention kernel
+
+**Checkpoints.** The engine's prefix reuse worked only for an exact extension of the held tokens (measured
+through the serve protocol: a prompt of 29 tokens + its 32-token answer + 8 new tokens reused 61). A chat turn
+re-rendered by the template diverges a few tokens before the previous prompt's end (the empty think block of the
+generation prompt is not rendered again), so the server's agent session reused nothing. Now serve() reads a
+prompt up to its last 16 tokens in chunks (a checkpoint of the recurrent state - every GDN layer's conv history
+and state matrix, hlast, ~63 MiB in host memory - after every full chunk), takes a checkpoint, then reads the
+tail as a small batch (slots + the pool, no streaming); a request that is not an exact extension restores the
+latest checkpoint at or before its common prefix with the held tokens and reads the rest (the KV cache keeps its
+cells below the position; the recurrent state cannot step back without a checkpoint). Up to 8 checkpoints are
+kept; `STRATA_Q36_PROMPT_TAIL=0` reads prompts in one go as before.
+
+Measured (two cards, serve protocol, a 2,900-token prompt):
+
+| request after the 2,900-token prompt | reused | read | prompt time |
+| --- | ---: | ---: | ---: |
+| the same + the answer + a new turn (exact extension) | 2,932 | 10 | 84 ms |
+| the answer rendered differently (diverges at its first token) | 2,884 | 31 | 240 ms |
+| an edit at token 2,500 | 2,048 (the chunk checkpoint) | 854 | 1.6 s |
+| an edit at token 100 | 0 | 2,902 | 3.1 s |
+
+The tail's 16 tokens take the hybrid rows path (resident experts on the GPU, the rest on the pool), not the
+streamed MMQ path, so the greedy text of a prompt is no longer bit-identical to upstream's for those tokens (the
+same arithmetic every generated token already uses).
+
+**Attention.** After a 14K-token prompt the decode fell to 32 tok/s (the CPU pool's share unchanged): the
+split-K decode attention kernel had every thread walk its own cell's K row (32 scattered rows per warp). A
+coalesced version (each warp scores 32 cells, a K row as 32 x 8 floats across the lanes, shuffle-reduced):
+14K context 37.7 / 40.3 / 40.2 tok/s (was 31.7 / 33.1 / 33.2), with 2 drafts 33.3 / 34.1 / 34.1 (was 26.9 /
+27.4 / 27.5); short context tg64 65.6 / 71.2 / 72.8 (was 60.8 / 64.7 / 64.3), with drafts 80.3 / 74.6 / 79.1.
+The dot product's summation order changed, so the greedy text drifts from upstream's after a few tokens (a
+near-tie flipped); `STRATA_Q36_ATTN=v1` keeps upstream's kernel (the parity reference). A third version reads
+each chunk's K / V once for the 8 query heads of a kv head (upstream read them 8 times over): numbers below.
+
+The third version (`STRATA_Q36_ATTN=v3`, the default; one block per chunk and kv head, its 8 query heads' scores
+from one read of the chunk's K and V): 14K context tg32 56.4 / 61.1 / 60.9 tok/s (upstream's kernel: 31.7 /
+33.1 / 33.2), with 2 drafts 61.2 / 63.8 / 63.6 (upstream: 26.9 / 27.4 / 27.5); short context tg64 62.0 / 67.0 /
+70.2, with drafts 71.8 / 68.2 / 77.6 (the same as v2 within noise). The long-context penalty is mostly gone:
+decode after a 14K prompt is now ~90% of the short-context rate instead of ~50%. `STRATA_Q36_ATTN=v1`
+reproduces the upstream greedy text exactly (checked: the 48-token parity prompt).

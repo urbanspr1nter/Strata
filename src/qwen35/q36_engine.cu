@@ -272,11 +272,11 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
     }
 }
 
-/// Split-K attention, one block per (chunk of 256 cells, query row): query row qi = t * H + h (t from t0) sees the
-/// cells [0, *pos0 + t].  Writes the chunk's partial accumulator, max and sum; chunks past the query's cells write
-/// nothing (the merge stops before them).  grid (n_chunk, n_rows), block 256, HD == 256.
-__global__ void k_attn_part(const float* q, const float* kc, const float* vc, const int32_t* pos0, int t0, int H,
-                            int HKV, int ctx, float scale, int n_chunk, float* pacc, float* pm, float* pl) {
+/// Split-K attention as 0.1.44 had it (STRATA_Q36_ATTN=v1, the bit-exact reference): one block per (chunk of 256
+/// cells, query row), every thread walks its own cell's K row - 32 rows a warp, a fraction of the card's bandwidth
+/// (32 tok/s after a 14K prompt on an RTX 2080).
+__global__ void k_attn_part_v1(const float* q, const float* kc, const float* vc, const int32_t* pos0, int t0, int H,
+                               int HKV, int ctx, float scale, int n_chunk, float* pacc, float* pm, float* pl) {
     constexpr int HD = 256;
     __shared__ float qs[HD], sc[kChunkCells], sh[kThreads];
     const int c = blockIdx.x, row = blockIdx.y;
@@ -300,6 +300,131 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, co
     sc[j] = e;
     const float l = block_sum(e, sh);
     const int n = min(kChunkCells, npos - p0);
+    float acc = 0.f;
+    const float* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
+    for (int k = 0; k < n; ++k) acc += sc[k] * vp[(size_t) k * HD];
+    const size_t o = (size_t) row * n_chunk + c;
+    pacc[o * HD + j] = acc;
+    if (j == 0) {
+        pm[o] = m;
+        pl[o] = l;
+    }
+}
+/// The 8 query heads of one kv head and one query token in one block (STRATA_Q36_ATTN=v3, the default): the
+/// chunk's K and V rows are read once for all eight (v2 read them once per query head, eight times over, mostly
+/// from DRAM again).  grid (n_chunk, n_tok * HKV), block 256; H / HKV == 8, HD == 256.  Each warp scores 32
+/// cells: a cell's K row as 32 x 8 floats across the lanes, eight dot products reduced with shuffles.
+__global__ void __launch_bounds__(256) k_attn_part_gqa(const float* q, const float* kc, const float* vc,
+                                                       const int32_t* pos0, int t0, int H, int HKV, int ctx,
+                                                       float scale, int n_chunk, float* pacc, float* pm, float* pl) {
+    constexpr int HD = 256, G = 8;
+    __shared__ float sc[G][kChunkCells];
+    __shared__ float sh[kThreads];
+    const int c = blockIdx.x, grp = blockIdx.y;   // grp = (t - t0) * HKV + kvh
+    const int t = t0 + grp / HKV, kvh = grp % HKV;
+    const int npos = *pos0 + t + 1;
+    const int p0 = c * kChunkCells;
+    if (p0 >= npos) return;
+    const int j = threadIdx.x, lane = j & 31, warp = j >> 5;
+    const int n = min(kChunkCells, npos - p0);
+    float4 qa[G], qb[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const float* qr = q + ((size_t) t * H + kvh * G + g) * HD + lane * 8;
+        qa[g] = *reinterpret_cast<const float4*>(qr);
+        qb[g] = *reinterpret_cast<const float4*>(qr + 4);
+    }
+    const float* kb = kc + ((size_t) kvh * ctx + p0) * HD + lane * 8;
+#pragma unroll 2
+    for (int w = 0; w < 32; ++w) {
+        const int p = warp * 32 + w;
+        float a[G];
+#pragma unroll
+        for (int g = 0; g < G; ++g) a[g] = 0.f;
+        if (p < n) {
+            const float* kr = kb + (size_t) p * HD;
+            const float4 k0 = *reinterpret_cast<const float4*>(kr), k1 = *reinterpret_cast<const float4*>(kr + 4);
+#pragma unroll
+            for (int g = 0; g < G; ++g)
+                a[g] = qa[g].x * k0.x + qa[g].y * k0.y + qa[g].z * k0.z + qa[g].w * k0.w + qb[g].x * k1.x + qb[g].y * k1.y +
+                       qb[g].z * k1.z + qb[g].w * k1.w;
+        }
+#pragma unroll
+        for (int g = 0; g < G; ++g)
+            for (int m = 16; m > 0; m >>= 1) a[g] += __shfl_xor_sync(0xffffffffu, a[g], m);
+        if (lane == 0)
+#pragma unroll
+            for (int g = 0; g < G; ++g) sc[g][p] = p < n ? a[g] * scale : -INFINITY;
+    }
+    __syncthreads();
+    float mx[G], ls[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const float s = sc[g][j];
+        mx[g] = block_max(s, sh);
+        const float e = j < n ? expf(s - mx[g]) : 0.f;
+        sc[g][j] = e;
+        ls[g] = block_sum(e, sh);
+    }
+    float acc[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) acc[g] = 0.f;
+    const float* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
+    for (int k = 0; k < n; ++k) {
+        const float v = vp[(size_t) k * HD];
+#pragma unroll
+        for (int g = 0; g < G; ++g) acc[g] += sc[g][k] * v;
+    }
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const int row = (t - t0) * H + kvh * G + g;
+        const size_t o = (size_t) row * n_chunk + c;
+        pacc[o * HD + j] = acc[g];
+        if (j == 0) {
+            pm[o] = mx[g];
+            pl[o] = ls[g];
+        }
+    }
+}
+/// Split-K attention, one block per (chunk of 256 cells, query row): query row qi = t * H + h (t from t0) sees the
+/// cells [0, *pos0 + t].  Writes the chunk's partial accumulator, max and sum; chunks past the query's cells write
+/// nothing (the merge stops before them).  grid (n_chunk, n_rows), block 256, HD == 256.  Each warp scores 32
+/// cells, a cell's K row read as 32 x 8 floats across the lanes (coalesced) and the dot product reduced with
+/// shuffles (STRATA_Q36_ATTN=v2; not bit-identical to v1's sum).
+__global__ void k_attn_part(const float* q, const float* kc, const float* vc, const int32_t* pos0, int t0, int H,
+                            int HKV, int ctx, float scale, int n_chunk, float* pacc, float* pm, float* pl) {
+    constexpr int HD = 256;
+    __shared__ float sc[kChunkCells], sh[kThreads];
+    const int c = blockIdx.x, row = blockIdx.y;
+    const int t = t0 + row / H, h = row % H, kvh = h / (H / HKV);
+    const int npos = *pos0 + t + 1;
+    const int p0 = c * kChunkCells;
+    if (p0 >= npos) return;
+    const int j = threadIdx.x, lane = j & 31, warp = j >> 5;
+    const int n = min(kChunkCells, npos - p0);
+    {   // this lane's 8 of the query's 256 dims against the same 8 of each cell's K row
+        const float* qr = q + ((size_t) t * H + h) * HD + lane * 8;
+        const float4 q0 = *reinterpret_cast<const float4*>(qr), q1 = *reinterpret_cast<const float4*>(qr + 4);
+        const float* kb = kc + ((size_t) kvh * ctx + p0) * HD + lane * 8;
+#pragma unroll 4
+        for (int w = 0; w < 32; ++w) {
+            const int p = warp * 32 + w;
+            float a = 0.f;
+            if (p < n) {
+                const float* kr = kb + (size_t) p * HD;
+                const float4 k0 = *reinterpret_cast<const float4*>(kr), k1 = *reinterpret_cast<const float4*>(kr + 4);
+                a = q0.x * k0.x + q0.y * k0.y + q0.z * k0.z + q0.w * k0.w + q1.x * k1.x + q1.y * k1.y + q1.z * k1.z + q1.w * k1.w;
+            }
+            for (int m = 16; m > 0; m >>= 1) a += __shfl_xor_sync(0xffffffffu, a, m);
+            if (lane == 0) sc[p] = p < n ? a * scale : -INFINITY;
+        }
+    }
+    __syncthreads();
+    const float s = sc[j];
+    const float m = block_max(s, sh);
+    const float e = j < n ? expf(s - m) : 0.f;
+    sc[j] = e;
+    const float l = block_sum(e, sh);
     float acc = 0.f;
     const float* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
     for (int k = 0; k < n; ++k) acc += sc[k] * vp[(size_t) k * HD];
@@ -1699,8 +1824,19 @@ struct Stage {
                     const int nt = std::min(rows_per, T - t0);
                     const int nc = graph_mode ? n_chunk
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
-                    k_attn_part<<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, kc[li], vc[li], dpos, t0, H, HKV, ctx,
-                                                                         1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl);
+                    static const int attn_v = [] {   // STRATA_Q36_ATTN=v1 (0.1.44's kernel) | v2 (coalesced) | v3 (default)
+                        const char* e = std::getenv("STRATA_Q36_ATTN");
+                        return e && e[0] == 'v' ? std::atoi(e + 1) : 3;
+                    }();
+                    if (attn_v == 1)
+                        k_attn_part_v1<<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, kc[li], vc[li], dpos, t0, H, HKV, ctx,
+                                                                                1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl);
+                    else if (attn_v == 2 || H != 8 * HKV)
+                        k_attn_part<<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, kc[li], vc[li], dpos, t0, H, HKV, ctx,
+                                                                             1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl);
+                    else
+                        k_attn_part_gqa<<<dim3(nc, nt * HKV), kChunkCells, 0, st>>>(q, kc[li], vc[li], dpos, t0, H, HKV, ctx,
+                                                                                   1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl);
                     k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att);
                 }
             }
@@ -2287,12 +2423,89 @@ struct Engine {
                 CK(cudaStreamSynchronize(L.st));
             }
             pos += T;
+            if (checkpoint_chunks && T == tmax && i + T < n) take_checkpoint();
             on_chunk(i + T);
         }
         if (m->hybrid) rebalance(hybrid_swaps_after_prompt);
     }
     /// the MTP seed rows of a prompt chunk: a buffer the block's own forward does not use (`moe_out`, [tmax][N])
     float* mtp_seed() { return last().moe_out; }
+
+    // ---- checkpoints: the recurrent state (every GDN layer's conv history and state matrix, hlast) at a position,
+    // in host memory, so a later request that shares the prefix up to there continues from it instead of reading
+    // the whole prompt again (the recurrent state cannot step back; the KV cache keeps its cells below the position).
+    // serve() takes one after every full prompt chunk and a few tokens before a prompt's end (the next turn of a
+    // conversation is rendered again by the chat template and diverges at the answer's start, just before the
+    // generation prompt's end), and restores the latest one at or before the common prefix.  ~63 MiB each here.
+    struct Ckpt {
+        int64_t pos = 0;
+        std::vector<std::vector<float>> conv, S;   // per layer (empty for an attention layer)
+        std::vector<float> hlast;
+    };
+    std::deque<Ckpt> ckpts;
+    static constexpr size_t kCkpts = 8;
+    bool checkpoint_chunks = false;   // process(): a checkpoint after every full prompt chunk (serve sets it)
+    void take_checkpoint() {
+        const auto& g = m->g;
+        sync_all();
+        Ckpt c;
+        c.pos = pos;
+        c.conv.resize(m->layers.size());
+        c.S.resize(m->layers.size());
+        for (auto& s : stg) {
+            OnDevice od(s->dev);
+            for (int l = s->lb; l < s->le; ++l) {
+                if (!s->conv[(size_t) l]) continue;
+                c.conv[(size_t) l].resize((size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1));
+                c.S[(size_t) l].resize((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size);
+                CK(cudaMemcpyAsync(c.conv[(size_t) l].data(), s->conv[(size_t) l], c.conv[(size_t) l].size() * 4,
+                                   cudaMemcpyDeviceToHost, s->st));
+                CK(cudaMemcpyAsync(c.S[(size_t) l].data(), s->S[(size_t) l], c.S[(size_t) l].size() * 4, cudaMemcpyDeviceToHost,
+                                   s->st));
+            }
+        }
+        {
+            Stage& L = last();
+            OnDevice od(L.dev);
+            c.hlast.resize((size_t) g.n_embd);
+            CK(cudaMemcpyAsync(c.hlast.data(), L.hlast, c.hlast.size() * 4, cudaMemcpyDeviceToHost, L.st));
+        }
+        sync_all();
+        while (!ckpts.empty() && ckpts.back().pos >= c.pos) ckpts.pop_back();   // (the same position again)
+        ckpts.push_back(std::move(c));
+        while (ckpts.size() > kCkpts) ckpts.pop_front();
+    }
+    /// The latest checkpoint at or before `at` (the common prefix with the held tokens), or null.
+    const Ckpt* checkpoint_at_or_before(int64_t at) const {
+        const Ckpt* best = nullptr;
+        for (const Ckpt& c : ckpts)
+            if (c.pos <= at && c.pos > 0 && (!best || c.pos > best->pos)) best = &c;
+        return best;
+    }
+    /// The state back at checkpoint c (the checkpoints after it are dropped: the sequence diverges there).
+    void restore_checkpoint(const Ckpt& c) {
+        sync_all();
+        for (auto& s : stg) {
+            OnDevice od(s->dev);
+            for (int l = s->lb; l < s->le; ++l) {
+                if (!s->conv[(size_t) l]) continue;
+                CK(cudaMemcpyAsync(s->conv[(size_t) l], c.conv[(size_t) l].data(), c.conv[(size_t) l].size() * 4,
+                                   cudaMemcpyHostToDevice, s->st));
+                CK(cudaMemcpyAsync(s->S[(size_t) l], c.S[(size_t) l].data(), c.S[(size_t) l].size() * 4, cudaMemcpyHostToDevice,
+                                   s->st));
+            }
+        }
+        {
+            Stage& L = last();
+            OnDevice od(L.dev);
+            CK(cudaMemcpyAsync(L.hlast, c.hlast.data(), c.hlast.size() * 4, cudaMemcpyHostToDevice, L.st));
+        }
+        const int64_t at = c.pos;
+        sync_all();
+        pos = at;
+        while (!ckpts.empty() && ckpts.back().pos > at) ckpts.pop_back();
+    }
+    void clear_checkpoints() { ckpts.clear(); }
 
     /// One speculative step with D MTP drafts (greedy): `x` is the next token (decided, not processed); `fix` the
     /// tokens of the rows the block must redo first (the drafts the last window accepted, seeded by hmain rows
@@ -2973,16 +3186,45 @@ int serve(Engine& E) {
         size_t reuse = 0;
         if (live.size() < ids.size() && std::equal(live.begin(), live.end(), ids.begin())) reuse = live.size();
         else {
-            E.reset();
-            live.clear();
+            // not an extension: the latest checkpoint at or before the common prefix, else from the start
+            size_t common = 0;
+            while (common < live.size() && common < ids.size() && live[common] == ids[common]) ++common;
+            const Engine::Ckpt* c = common > 0 ? E.checkpoint_at_or_before((int64_t) std::min(common, ids.size() - 1)) : nullptr;
+            if (c) {
+                reuse = (size_t) c->pos;
+                E.restore_checkpoint(*c);
+                live.resize(reuse);
+            } else {
+                E.reset();
+                E.clear_checkpoints();
+                live.clear();
+            }
         }
         const auto t0 = Clock::now();
         const int64_t fresh = (int64_t) (ids.size() - reuse);
-        E.process(ids.data() + reuse, fresh, [&](int64_t done) {
-            std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) fresh, ms_since(t0),
-                        (double) done / std::max(1e-9, ms_since(t0) / 1000.0));
-            std::fflush(stdout);
-        });
+        auto progress = [&](int64_t base) {
+            return [&, base](int64_t done) {
+                std::printf("PP %lld %lld %.0f %.1f\n", (long long) (base + done), (long long) fresh, ms_since(t0),
+                            (double) (base + done) / std::max(1e-9, ms_since(t0) / 1000.0));
+                std::fflush(stdout);
+            };
+        };
+        // the prompt but its last kTail tokens in chunks (a checkpoint after every full one), a checkpoint, then the
+        // tail on its own (a small batch: slots + the pool, no streaming): the next turn of a conversation shares the
+        // prompt up to the answer's start, a few tokens before the end, and continues from that checkpoint
+        static const int64_t kTail = [] {   // STRATA_Q36_PROMPT_TAIL=N (0: the whole prompt in one go, as 0.1.44)
+            const char* e = std::getenv("STRATA_Q36_PROMPT_TAIL");
+            return e ? std::max<int64_t>(0, std::atoll(e)) : 16;
+        }();
+        E.checkpoint_chunks = true;
+        if (kTail > 0 && fresh > kTail + 8) {
+            E.process(ids.data() + reuse, fresh - kTail, progress(0));
+            E.take_checkpoint();
+            E.process(ids.data() + reuse + (fresh - kTail), kTail, progress(fresh - kTail));
+        } else {
+            E.process(ids.data() + reuse, fresh, progress(0));
+        }
+        E.checkpoint_chunks = false;
         live.insert(live.end(), ids.begin() + (long) reuse, ids.end());
         const double prompt_ms = ms_since(t0);
         std::mt19937_64 rng(smp.seed);

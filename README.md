@@ -13,6 +13,10 @@ Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Nex
 large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
 and coding agents. Nothing leaves your PC.
 
+> **This fork** tailors Strata to one PC with two 8 GB cards (2x RTX 2080, an i5-13400, 32 GB) and runs
+> **Qwen3.6-35B-A3B** on both cards: [docs/QWEN36.md](docs/QWEN36.md) says what changed and what it measured;
+> [AGENTS_FORK.md](AGENTS_FORK.md) is the project log. Everything below is upstream's README.
+
 ## How fast is it?
 
 We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
