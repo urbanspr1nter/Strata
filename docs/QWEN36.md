@@ -33,6 +33,11 @@ it starts and runs well on 8 GB cards, and on two of them.
   tokens before a prompt's end, where the next turn diverges) and restores the latest one at or before the
   common prefix. Measured: a re-rendered follow-up after a 2,900-token prompt reads 31 tokens in 0.24 s instead
   of 2,900 in 3.3 s. `STRATA_Q36_PROMPT_TAIL=0` reads prompts in one go as before.
+- **An 8-bit KV cache** (`--kv q8_0`; setup writes it for a card under 12 GB or a context past 64K; `--kv f32` is
+  upstream's). K and V rows are 8 fp16 scales and 256 int8 (272 bytes instead of 1,024): the same class as
+  llama.cpp's q8_0 cache. 262K context fits on two 8 GB cards with it; 128K and 32K get more expert slots.
+  Measured (engine bench, short chats): 32K 69-71 tok/s (82-107 with drafts), 128K 63-68 (94-97), 262K 58-61
+  (76-79); after a 40,000-token prompt at 262K, 50-54 tok/s and the prompt read at 700-735 tok/s.
 - **Long contexts.** The decode attention kernel read each cell's K row with one thread (32 scattered rows per
   warp) and decoded at 32 tok/s after a 14K prompt. The default kernel now gives one block to a chunk of 256
   cells and a kv head, reads its K and V once and scores the 8 query heads from them: 56-61 tok/s after a 14K
@@ -83,8 +88,10 @@ dependency; ~2 ms of host overhead. Drafts amortize all of it.
 - `--chunk 1024` or `512`: smaller prompt buffers, so more expert slots on the first card and a few more layers on
   the second (33 / 39 slots per layer, 7 / 8 resident layers), but the prompt streams the first card's experts
   once per chunk over PCIe: 700 / 350 tok/s instead of 1,290 at 2048. Decode +3-5%.
-- `--max-context`: the KV cache is fp32 (45 KB per token) and is split between the cards by layer; 32K costs
-  ~1.4 GiB in all.
+- `--max-context`: the cache is allocated for the whole context at start and takes the first card's expert-slot
+  room: with the 8-bit cache 32K leaves 40 slots per layer, 128K 20, 262K none (then every expert of the first
+  card's layers runs on the CPU pool: 58-61 tok/s plain, 76-79 with drafts, instead of 69-71 / 82-107 at 32K).
+  `./setup.sh --setup --context N` changes it; fp32 K/V (`--kv f32`, 45 KB per token) runs up to 64K here.
 - `STRATA_Q36_NO_LAYER_GRAPH=1`: the eager decode; `STRATA_Q36_NO_SPEC_SAMPLING=1`: sampled requests one token at
   a time; `--pool-tasks N`, `--pool-affinity`, `--pin-host no`.
 - Host memory: the first card's experts are pinned (15.4 GiB here) and cannot be swapped; a 24 GB swap file was

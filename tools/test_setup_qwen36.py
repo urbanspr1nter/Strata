@@ -145,6 +145,22 @@ class InstallOwnPath(unittest.TestCase):
         self.assertEqual(Path(self.cfg["exe"]).parent, self.root / "engine")
         self.assertIn(("config", "strata-qwen36-ud-q4_k_xl.json"), self.calls)
 
+    def test_kv_cache_format(self):
+        # an 8 GB card gets the 8-bit KV cache, a 16 GB card fp32 at 32K and 8-bit past 64K; --kv decides either way
+        self.install(model="UD-Q4_K_XL", vram=8.0)
+        a = self.cfg["args"]
+        self.assertEqual(a[a.index("--kv") + 1], "q8_0")
+        self.install(model="UD-Q4_K_XL", vram=16.0)
+        self.assertNotIn("--kv", self.cfg["args"])
+        self.install(model="UD-Q4_K_XL", vram=16.0, context=131072)
+        a = self.cfg["args"]
+        self.assertEqual(a[a.index("--kv") + 1], "q8_0")
+        self.install(model="UD-Q4_K_XL", vram=8.0, kv="f32")
+        self.assertNotIn("--kv", self.cfg["args"])
+        rc, out = self.install(model="UD-Q4_K_XL", vram=16.0, kv="int8")
+        self.assertIn("does not use them", out)
+        self.assertNotIn("--kv", self.cfg["args"])
+
     def test_default_size_follows_the_ram(self):
         rc, out = self.install(ram=64.0)
         self.assertEqual(rc, 0, out)

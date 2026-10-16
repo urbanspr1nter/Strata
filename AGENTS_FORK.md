@@ -310,3 +310,25 @@ A fresh `git clone -b fork/2080x2` into another folder, `./setup.sh --yes --fami
 28 GB now: measured 15.4 GiB pinned with two cards), the engine compiled from the clone (no ready-made engine for
 0.1.44.1), the two-card config and run script written; its server loaded and answered a chat request. Nothing
 else was running at the time (two instances would each need an arena and the cards).
+
+## 2026-10-16 - an 8-bit KV cache (`--kv q8_0`): 262K context fits, and 32K gets faster
+
+K and V rows are stored as 8 fp16 scales (one per 32 values) and 256 int8 (272 bytes a row instead of 1,024 as
+fp32: llama.cpp's q8_0 cache in all but the layout), written by the per-token prep kernel (a warp's 32 values share
+a scale), read by the shared-head decode attention kernel and by the prompt path's fp16-copy kernel. The fp32 cache
+stays the engine default (`--kv f32`, bit-exact with upstream under `STRATA_Q36_ATTN=v1`: checked again); setup
+writes `--kv q8_0` for a card under 12 GB or a context past 64K. Engine bench, two cards, chunk 2048, `--mtp 2`:
+
+| `--max-context` | second card holds | first card's slots per layer | pp2048 | tg64 | tg64 with 2 drafts |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 32K fp32 (before) | 7 layers | 25 | 1,195-1,300 | 65-68 | 88-98 |
+| 32K q8_0 | 8 layers | 40 | 1,082-1,321 | 69-71 | 82-107 |
+| 128K q8_0 | 7 layers | 20 | 1,094-1,302 | 63-68 | 94-97 |
+| 262K q8_0 | 5 layers | 0 (every expert of layers 0-34 on the pool) | 1,129-1,282 | 58-61 | 76-79 |
+
+At 262K with a 40,000-token prompt: 699-735 tok/s reading it (the prompt attention's query slices shrink with the
+prefix under the 64 MB scores buffer), then 50-54 tok/s with or without drafts (no slots on the first card: the
+drafts' extra rows cost the pool what they save on the GPU). The greedy text with the 8-bit cache at 13 fixed
+slots was the fp32 text of the same kernel for 47 of 48 tokens. The installed config is now
+`--max-context 262144 --kv q8_0` (the user's expectation); `./setup.sh --setup --context 131072` is the faster
+choice (20 slots: 94-97 tok/s with drafts in short chats).

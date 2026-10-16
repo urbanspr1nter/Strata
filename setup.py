@@ -452,8 +452,10 @@ OWN_PATH_FAMILIES = {
                           "Q8_0": {"about": "8-bit, the closest to the full model", "ram_gb": 52}},
                "sha256": QWEN36_FILES,
                # the engine's KV cache per context token: 10 attention layers + the MTP block, 2 KV heads x 256, K and
-               # V in fp32 (strata-q36)
+               # V in fp32 (strata-q36), or as 8-bit rows of 272 bytes (--kv q8_0: a card under 12 GB, or a context
+               # past 64K)
                "kv_bytes_per_token": 11 * 2 * 256 * 2 * 4,
+               "kv_bytes_per_token_q8": 11 * 2 * 272 * 2,
                "mtp": 2,                     # drafts per step (greedy requests): measured best on the R9700
                "vision": False},             # the image encoder for this family is not wired up yet
 }
@@ -4577,7 +4579,9 @@ def choices_from_config(cfg_path: Path) -> dict:
         size = next((m for m in d["models"] if m.lower() == tag[len(d["tag"]):].lower()), None)
         a = cfg.get("args", [])
         ctx = a[a.index("--max-context") + 1] if "--max-context" in a and a.index("--max-context") + 1 < len(a) else None
-        return {"family": own, "model": size, "context": int(ctx) if ctx and ctx.isdigit() else None, "kv": None,
+        kvv = a[a.index("--kv") + 1] if "--kv" in a and a.index("--kv") + 1 < len(a) else None
+        return {"family": own, "model": size, "context": int(ctx) if ctx and ctx.isdigit() else None,
+                "kv": kvv if kvv in ("q8_0", "f32") else None,
                 "vision": "none", "esp": "off", "host": cfg.get("host"), "api_key": cfg.get("api_key"),
                 "port": cfg.get("port"), "gpu": cfg.get("gpu"), "layer_split": cfg.get("layer_split"),
                 "cuda": 12 if config_toolkit(cfg) == 12 else None, "vram_reserve_mib": None}
@@ -5578,8 +5582,10 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     else:
         ctxs = [c for c in CONTEXTS if c <= 262144]   # the model's trained length; no rope scaling on this path yet
         say()
+        q8_text = gpu.get("vram_gb", 0.0) < 12            # (the format the config will get at this size, see below)
+        per32k = (fam["kv_bytes_per_token_q8"] if q8_text else fam["kv_bytes_per_token"]) * 32768 / 2**30
         say("  Context length = how much text the model can see at once. Its cache takes "
-            f"{fam['kv_bytes_per_token'] * 32768 / 2**30:.1f} GB of VRAM per 32K tokens, room the experts would use:")
+            f"{per32k:.2f} GB of VRAM per 32K tokens ({'8-bit rows' if q8_text else 'fp32'}), room the experts would use:")
         for i, c in enumerate(ctxs, 1):
             say(f"  {i}) {c // 1024}K tokens" + ("   (recommended for your GPU)" if c == rec_ctx else ""))
         ctx = ctxs[int(ask("Context?", [str(i) for i in range(1, len(ctxs) + 1)], str(ctxs.index(rec_ctx) + 1),
@@ -5588,11 +5594,17 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         warn(f"{ctx // 1024}K is past {fam['title']}'s trained 262,144 positions and this engine path has no rope "
              "scaling yet: kept as you chose, but answers past 256K are untested")
     ok(f"context: {ctx} tokens")
+    # the KV cache's format: 8-bit rows (a quarter of the VRAM of fp32, llama.cpp's q8_0 class) on a card under 12 GB
+    # or for a context past 64K, else fp32 as upstream; --kv q8_0 / --kv f32 decides either way
+    kv = a.kv if a.kv in ("q8_0", "f32") else ("q8_0" if gpu.get("vram_gb", 0.0) < 12 or ctx > 65536 else "f32")
+    if kv == "q8_0":
+        ok(f"KV cache: 8-bit rows ({fam['kv_bytes_per_token_q8'] * ctx / 2**30:.2f} GiB at {ctx} tokens, over the cards)")
     if a.vision not in (None, "no", "none"):
         warn(f"images are not available with {fam['title']} yet: off")
-    if a.rope_scaling or a.rope_scale or a.kv or a.resident_budget_gib is not None or a.low_ram not in (None, "auto"):
-        warn(f"--rope-scaling / --kv / --resident-budget-gib / --low-ram are Flash-Next settings: {fam['title']} "
-             "does not use them")
+    if a.rope_scaling or a.rope_scale or (a.kv and a.kv not in ("q8_0", "f32")) or a.resident_budget_gib is not None or \
+            a.low_ram not in (None, "auto"):
+        warn(f"--rope-scaling / --kv int8|q4_0 / --resident-budget-gib / --low-ram are Flash-Next settings: {fam['title']} "
+             "does not use them (its --kv takes q8_0 or f32)")
     folder = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
     gguf = folder / fam["file"].format(q=model)
     size = fam["sha256"][gguf.name][0]
@@ -5632,6 +5644,8 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
 
     step(7, "writing the start script")
     args = ["--native", str(gguf), "--max-context", str(ctx), "--prefill", "auto", "--mtp", str(fam["mtp"])]
+    if kv == "q8_0":
+        args += ["--kv", "q8_0"]
     if a.vram_reserve_mib is not None:             # VRAM left free for other programs: the experts take that much less
         vram = gpu.get("vram_gb", 0.0)
         if vram > 0:
