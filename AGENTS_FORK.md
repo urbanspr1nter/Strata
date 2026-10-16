@@ -333,6 +333,54 @@ slots was the fp32 text of the same kernel for 47 of 48 tokens. The installed co
 `--max-context 262144 --kv q8_0` (the user's expectation); `./setup.sh --setup --context 131072` is the faster
 choice (20 slots: 94-97 tok/s with drafts in short chats).
 
+## 2026-10-16 - the CPU pool's K-quant rows on AVX-VNNI, several tokens per pass (`STRATA_KQ_VNNI=1`, opt-in)
+
+`src/kernels/cpu/kq_vnni.cpp`: Q4_K, Q5_K and Q6_K rows against Q8_K activations (this model's gate/up and down
+projections) for 1..8 activation rows per pass over the weights, bit-exact against ggml-cpu's AVX2 dots
+(`kq_vnni_parity`: 0 of 27,540 kernel values and 0 of 184,320 engine-entry-point values differ, on blocks from ggml's
+quantizers and on random bytes, 1..8 rows, whole and partial row ranges). The design: ggml's integer chain is exact
+(maddubs cannot saturate for these formats and the int32 sums stay far below 2^31), so any instruction that puts the
+same integer in the same lane gives the same bits; the u8 x s8 pair products stay `vpmaddubsw`, ggml's `vpmaddwd` +
+`vpaddd` (scale times pair sums, accumulated) become one `vpdpwssd`, the float steps are ggml's in ggml's order per
+row (the eight rows' block scales from two vector multiplies, the mins' correction two rows per register), and the
+loop over the activation rows sits inside the loop over the blocks: a block's nibbles, high bits, 6-bit scales and
+mins are unpacked once for all rows. Wired into `native_gu_rows` / `native_down_rows` behind `STRATA_KQ_VNNI=1` and
+`cpu_avxvnni_ok()` (CPUID 7.1:EAX[4]), from two rows on; the default path is ggml's as before.
+
+What was measured on the way (i5-13400, one P-core, a 2048 x 512 expert in cache, `kq_vnni_parity --bench`):
+
+- `vpdpwssd` alone is no faster than ggml's pair here: eight independent chains run at 2.4 ns per eight `vpdpwssd`
+  against 2.1 per eight `vpmaddwd` + `vpaddd` (one port for it, two for `vpmaddwd`; the E-core 5.2 against 4.0).
+  Inside the kernels the one uop still wins: the pair form measured 10-15% slower at 4-8 rows (196 vs 168 us, 358
+  vs 310 us per q4_K/q5_K expert). The gain is the structure, not the instruction.
+- A first version broadcast the sub-block scales through registers (`vpextrw`, `vmovd`, `vpbroadcastw`: three port-5
+  uops per scale, 24 per block): 0.82x ggml at one row. Broadcast loads from a table kept in memory: 1.02x.
+- Unpacking a row's scales before the block loop (to shorten a block's chain) measured no faster (92.7 vs 85.6 us
+  at one row); the per-block unpack stays.
+- One row: ggml's speed on a P-core (87.1 vs 87.7 us; from DRAM 0.109 vs 0.111 ms) and slower on an E-core
+  (0.296 vs 0.253 ms from DRAM) - the multi-row machinery's uops, which the E-core's narrower vector units pay for -
+  so, like `STRATA_KQ256`, the kernels are taken from two rows on. Two rows: 1.42-1.51x; four: 1.9-2.0x; eight:
+  2.0-2.2x (us per expert, ggml -> kernels: q4_K/q5_K 175 -> 116, 340 -> 167, 681 -> 310; q4_K/q6_K 158 -> 111,
+  307 -> 160, 612 -> 301).
+
+The pool's own calls streaming 2 GB of experts from DRAM (`kq_cpu_bench --n-embd 2048 --n-ff 512 --mb 2048`, the
+engine's decode case; one thread pinned to a P-core (CPU 4) or an E-core (CPU 12), 10 threads one per physical core
+with CPU 0 left to another process that was running at the time; % of the DRAM's measured 81 GB/s; the committed
+rule, so one row per job is ggml's dot in both columns and its spread there, 77 vs 74 GB/s, is the run-to-run noise):
+
+| expert | rows per job | P-core, 1 thread, ggml | `STRATA_KQ_VNNI=1` | 10 threads, ggml | `STRATA_KQ_VNNI=1` | E-core, 1 thread, ggml | `STRATA_KQ_VNNI=1` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| q4_K/q5_K | 1 | 0.114 ms | 0.114 ms | 77.4 GB/s (96%) | 74.1 (91%) | 0.269 ms | 0.268 ms |
+| q4_K/q5_K | 2 | 0.199 ms | 0.137 ms | 58.5 GB/s (72%) | 73.5 (91%) | 0.511 ms | 0.403 ms |
+| q4_K/q5_K | 4 | 0.369 ms | 0.183 ms | 34.6 GB/s (43%) | 61.3 (76%) | 1.003 ms | 0.727 ms |
+| q4_K/q6_K | 1 | 0.113 ms | 0.113 ms | 71.6 GB/s (88%) | 72.3 (89%) | 0.255 ms | 0.256 ms |
+| q4_K/q6_K | 2 | 0.189 ms | 0.136 ms | 60.3 GB/s (74%) | 69.4 (86%) | 0.467 ms | 0.404 ms |
+| q4_K/q6_K | 4 | 0.333 ms | 0.177 ms | 40.6 GB/s (50%) | 67.6 (83%) | 0.911 ms | 0.694 ms |
+
+A two-row job on the pool therefore costs 1.05x a one-row job instead of 1.3x, a four-row job 1.1-1.2x instead of
+1.8-2.2x: the verify windows and hybrid batches (2-8 rows) no longer pay linearly. Not yet measured: the engine end
+to end with `STRATA_KQ_VNNI=1` (the GPUs were busy with another benchmark).
+
 ## Future improvements (not done; each with the measurement that motivates it)
 
 - **Prompt attention at long prefixes.** A 40,000-token prompt reads at 700-735 tok/s against ~1,300 for a short
@@ -344,11 +392,11 @@ choice (20 slots: 94-97 tok/s with drafts in short chats).
   and the first idles while the second runs its resident layers; Flash-Next overlaps the stages' chunks on a
   second host thread (`std::async`, docs/MULTI_GPU.md). Worth ~10% on prompts here (the first card's stream
   dominates).
-- **The CPU pool's kernel.** One P-core computes an expert in 0.10 ms from L3 (compute-bound: ggml's AVX2
-  maddubs/madd rows reach 17-19 GB/s of weights against 29 GB/s streaming), and the cost is linear in the rows
-  of a job, so a verify window of 3 rows costs the pool ~3x. An AVX-VNNI (`vpdpbusd`, the i5-13400 has it) K-quant
-  row kernel with the rows inside the block loop would raise the pool's ceiling (74 GB/s of 81 measured at one
-  row, 58 at two) and make drafts pay with few slots. Not bit-exact with ggml: opt-in.
+- **The CPU pool's kernel, in the engine.** The multi-row kernels above (`STRATA_KQ_VNNI=1`, bit-exact) take the
+  pool from 58-60 GB/s to 69-74 at two rows per job and from 35-41 to 61-68 at four; what that is worth in tokens
+  per second with drafts (`--mtp 2`, few slots) is not measured yet. One row stays ggml's dot: the kernels are no
+  faster there on a P-core and slower on an E-core, so a one-row kernel would need less per-block work (the per-row
+  `std::exp`, the q8s pass and the chain adds are the candidates), or ggml's dot could run on E-cores only.
 - **Fewer barriers per layer.** Two pool phases (gate/up rows, then down rows) with a full barrier each, 40 layers
   per token; with ~7 missed experts per layer, whole-expert tasks (one phase) or a pipelined publish would cut
   ~1-2 ms per token.

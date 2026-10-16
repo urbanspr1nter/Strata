@@ -5,7 +5,10 @@
 // fresh read from DRAM.  Prints the weight bytes per second against the --ram-gbs given (a separate read test).
 //
 //     kq_cpu_bench [--pairs q4_K/q5_1,q5_K/q8_0,q6_K/q8_0,q8_0/q8_0,iq3_s/iq4_nl] [--threads 1,8,16,32] [--nt 1,2,4]
-//                  [--mb 4096] [--reps 3] [--ram-gbs N]
+//                  [--mb 4096] [--reps 3] [--ram-gbs N] [--n-embd 2560] [--n-ff 640]
+//
+// --n-embd / --n-ff: the expert's shape (the defaults are Flash-Next's; Qwen3.6-35B-A3B is --n-embd 2048 --n-ff 512).
+// STRATA_KQ_VNNI=1 in the environment takes the AVX-VNNI K-quant rows where the CPU has them (native_expert.cpp).
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 
@@ -29,7 +32,7 @@ namespace cpu = strata::kernels::cpu;
 
 namespace {
 
-constexpr int64_t kH = 2560, kFF = 640;
+int64_t g_n_embd = 2560, g_n_ff = 640;   // --n-embd, --n-ff
 constexpr int kMaxT = 8;
 
 int type_of(const std::string& s) {
@@ -56,16 +59,16 @@ std::vector<std::string> split(const std::string& s) {
 // weights quantized by ggml-cpu (valid scales, as a real file has)
 void make_blob(const cpu::NativeFmt& f, uint8_t* blob, std::mt19937& rng) {
     std::normal_distribution<float> nd(0.f, 0.02f);
-    std::vector<float> row((size_t) std::max(kH, kFF));
+    std::vector<float> row((size_t) std::max(g_n_embd, g_n_ff));
     const auto* tg = ggml_get_type_traits_cpu((ggml_type) f.gu_type);
     const auto* td = ggml_get_type_traits_cpu((ggml_type) f.d_type);
-    for (int64_t r = 0; r < 2 * kFF; ++r) {
-        for (int64_t i = 0; i < kH; ++i) row[(size_t) i] = nd(rng);
-        tg->from_float(row.data(), blob + (size_t) r * f.gu_row, kH);
+    for (int64_t r = 0; r < 2 * g_n_ff; ++r) {
+        for (int64_t i = 0; i < g_n_embd; ++i) row[(size_t) i] = nd(rng);
+        tg->from_float(row.data(), blob + (size_t) r * f.gu_row, g_n_embd);
     }
-    for (int64_t r = 0; r < kH; ++r) {
-        for (int64_t i = 0; i < kFF; ++i) row[(size_t) i] = nd(rng);
-        td->from_float(row.data(), blob + f.down_off + (size_t) r * f.d_row, kFF);
+    for (int64_t r = 0; r < g_n_embd; ++r) {
+        for (int64_t i = 0; i < g_n_ff; ++i) row[(size_t) i] = nd(rng);
+        td->from_float(row.data(), blob + f.down_off + (size_t) r * f.d_row, g_n_ff);
     }
 }
 
@@ -87,21 +90,26 @@ int main(int argc, char** argv) {
         else if (a == "--mb" && more) mb = std::atoi(argv[++i]);
         else if (a == "--reps" && more) reps = std::max(1, std::atoi(argv[++i]));
         else if (a == "--ram-gbs" && more) ram = std::atof(argv[++i]);
+        else if (a == "--n-embd" && more) g_n_embd = std::atoll(argv[++i]);
+        else if (a == "--n-ff" && more) g_n_ff = std::atoll(argv[++i]);
         else {
-            std::fprintf(stderr, "usage: kq_cpu_bench [--pairs a/b,...] [--threads 1,8] [--nt 1,2,4] [--mb 4096] [--reps 3] [--ram-gbs N]\n");
+            std::fprintf(stderr, "usage: kq_cpu_bench [--pairs a/b,...] [--threads 1,8] [--nt 1,2,4] [--mb 4096] [--reps 3] [--ram-gbs N] [--n-embd 2560] [--n-ff 640]\n");
             return 2;
         }
     }
     ggml_cpu_init();
-    std::printf("kq_cpu_bench: %s (avx2 %d, avx512 %d), %d MB of blobs per format\n", cpu::cpu_name().c_str(),
-                (int) cpu::cpu_avx2_ok(), (int) cpu::cpu_avx512_ok(), mb);
+    const char* vnni_env = std::getenv("STRATA_KQ_VNNI");
+    std::printf("kq_cpu_bench: %s (avx2 %d, avx512 %d, avx-vnni %d%s), %d MB of blobs per format, experts %lld x %lld\n",
+                cpu::cpu_name().c_str(), (int) cpu::cpu_avx2_ok(), (int) cpu::cpu_avx512_ok(), (int) cpu::cpu_avxvnni_ok(),
+                vnni_env != nullptr && std::atoi(vnni_env) != 0 ? ", STRATA_KQ_VNNI=1" : "", mb, (long long) g_n_embd,
+                (long long) g_n_ff);
     for (const std::string& pair : pairs) {
         const size_t slash = pair.find('/');
         const int gt = slash == std::string::npos ? -1 : type_of(pair.substr(0, slash));
         const int dt = slash == std::string::npos ? -1 : type_of(pair.substr(slash + 1));
         cpu::NativeFmt f;
         std::string err;
-        if (gt < 0 || dt < 0 || !cpu::native_fmt(gt, dt, kH, kFF, f, err)) {
+        if (gt < 0 || dt < 0 || !cpu::native_fmt(gt, dt, g_n_embd, g_n_ff, f, err)) {
             std::printf("%s: %s\n", pair.c_str(), err.empty() ? "unknown types" : err.c_str());
             continue;
         }
@@ -124,7 +132,7 @@ int main(int argc, char** argv) {
         const void* act[kMaxT];
         const void* hq[kMaxT];
         for (int t = 0; t < kMaxT; ++t) {
-            std::vector<float> x(kH), h(kFF);
+            std::vector<float> x(g_n_embd), h(g_n_ff);
             for (auto& v : x) v = nd(rng);
             for (auto& v : h) v = 0.1f * nd(rng);
             cpu::native_quant_act(f, x.data(), xa[t].data());
@@ -140,17 +148,17 @@ int main(int argc, char** argv) {
                 for (int rep = 0; rep < reps; ++rep) {
                     std::atomic<size_t> next{0};
                     auto work = [&] {
-                        std::vector<float> ffb((size_t) kMaxT * kFF), outb((size_t) kMaxT * kH);
+                        std::vector<float> ffb((size_t) kMaxT * g_n_ff), outb((size_t) kMaxT * g_n_embd);
                         float* ff[kMaxT];
                         float* out[kMaxT];
-                        for (int t = 0; t < kMaxT; ++t) { ff[t] = &ffb[(size_t) t * kFF]; out[t] = &outb[(size_t) t * kH]; }
+                        for (int t = 0; t < kMaxT; ++t) { ff[t] = &ffb[(size_t) t * g_n_ff]; out[t] = &outb[(size_t) t * g_n_embd]; }
                         std::vector<std::vector<uint8_t>> hb(kMaxT, std::vector<uint8_t>(cpu::kNativeHBytes));
                         for (;;) {
                             const size_t e = next.fetch_add(1);
                             if (e >= E) break;
                             const uint8_t* blob = blobs + e * f.bytes;
-                            cpu::native_gu_rows(f, blob, act, nt, ff, 0, (int) kFF);
-                            cpu::native_down_rows(f, blob, hq, nt, out, 0, (int) kH);
+                            cpu::native_gu_rows(f, blob, act, nt, ff, 0, (int) g_n_ff);
+                            cpu::native_down_rows(f, blob, hq, nt, out, 0, (int) g_n_embd);
                         }
                         volatile float sink = outb[0] + ffb[0];
                         (void) sink;
