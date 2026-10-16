@@ -332,3 +332,42 @@ drafts' extra rows cost the pool what they save on the GPU). The greedy text wit
 slots was the fp32 text of the same kernel for 47 of 48 tokens. The installed config is now
 `--max-context 262144 --kv q8_0` (the user's expectation); `./setup.sh --setup --context 131072` is the faster
 choice (20 slots: 94-97 tok/s with drafts in short chats).
+
+## Future improvements (not done; each with the measurement that motivates it)
+
+- **Prompt attention at long prefixes.** A 40,000-token prompt reads at 700-735 tok/s against ~1,300 for a short
+  one: the prompt attention slices the chunk's queries so that the scores fit the 64 MB buffer (`tq` rows per
+  cuBLAS call shrinks as the prefix grows), and every chunk converts the whole fp16 copy of the prefix again
+  (`k_kv_f16`, O(prefix) per chunk). A flash-style pass over key blocks with a running max, or a larger scores
+  buffer where VRAM allows, would keep long prompts near the PCIe bound.
+- **Prompt chunks overlapped across the cards.** The second card idles while the first streams a chunk's experts
+  and the first idles while the second runs its resident layers; Flash-Next overlaps the stages' chunks on a
+  second host thread (`std::async`, docs/MULTI_GPU.md). Worth ~10% on prompts here (the first card's stream
+  dominates).
+- **The CPU pool's kernel.** One P-core computes an expert in 0.10 ms from L3 (compute-bound: ggml's AVX2
+  maddubs/madd rows reach 17-19 GB/s of weights against 29 GB/s streaming), and the cost is linear in the rows
+  of a job, so a verify window of 3 rows costs the pool ~3x. An AVX-VNNI (`vpdpbusd`, the i5-13400 has it) K-quant
+  row kernel with the rows inside the block loop would raise the pool's ceiling (74 GB/s of 81 measured at one
+  row, 58 at two) and make drafts pay with few slots. Not bit-exact with ggml: opt-in.
+- **Fewer barriers per layer.** Two pool phases (gate/up rows, then down rows) with a full barrier each, 40 layers
+  per token; with ~7 missed experts per layer, whole-expert tasks (one phase) or a pipelined publish would cut
+  ~1-2 ms per token.
+- **Expert slots.** At 20-40 slots per layer the first card's hit rate is 20-40%. Per-layer slot counts (layers
+  differ in routing entropy), a warm start from the prompt's routing counts instead of experts 0..S-1, and swaps on
+  the copy stream (today the engine stream + a sync) are the cheap experiments; `--chunk 1024` trades 45% of the
+  prompt rate for 8 more slots.
+- **Packed Q8_0 decode copies on the second card only.** The Q8_0 dense GEMVs are ~4.5 ms of a token; the
+  packed layout upstream built them for is "a little faster" but costs 1.8 GiB over both cards; the second card has
+  the room at 32K and 128K (not at 262K). Needs per-device packing in load().
+- **More drafts where they pay.** `--mtp 3` with code (40 of 48 drafts accepted at 2) and a draft count that
+  follows the slots (at 262K the drafts' pool cost cancels their gain after a long prompt).
+- **Finer checkpoints.** One per 2,048-token chunk and one before the prompt's tail; an edit in the middle of a
+  conversation falls back up to 2,048 tokens (1.6 s). Checkpoints every 512 tokens would cost ~63 MiB of host
+  memory each.
+- **Host memory.** The GGUF mapping stays open after the arena is filled (its page cache competes with the rest;
+  `posix_fadvise(DONTNEED)` after load would release it), the token table is a 515 MB host copy, and the arena
+  is pinned as a whole (a pageable arena for the pool's share would let the OS reclaim; the stream copies need
+  pinned pages).
+- **Not on this path at all:** several requests at once (`--batch` / `"parallel"`), images (the family's mmproj is
+  not wired up), the conversation cache's session files, rope scaling past 262K, the AMD build (guarded, not
+  built here), Windows (not built here).
