@@ -236,3 +236,24 @@ from one read of the chunk's K and V): 14K context tg32 56.4 / 61.1 / 60.9 tok/s
 70.2, with drafts 71.8 / 68.2 / 77.6 (the same as v2 within noise). The long-context penalty is mostly gone:
 decode after a 14K prompt is now ~90% of the short-context rate instead of ~50%. `STRATA_Q36_ATTN=v1`
 reproduces the upstream greedy text exactly (checked: the 48-token parity prompt).
+
+## 2026-10-16 - the final engine through the server (commit 2ce1bdc3 + this log)
+
+`./setup.sh --yes --family qwen36 --model UD-Q4_K_XL --gpus all --no-start`, then `tools/strata_bench.py`
+against the running server (greedy, thinking off, medians of 3):
+
+| test | prompt tok/s | decode tok/s | first token |
+| --- | ---: | ---: | ---: |
+| short chat (46-token prompts, 100 out) | - | 79.9 (66.8-92.2) | 0.36 s |
+| 4K prompt, fresh | 1,216 | - | 3.31 s |
+| 16K prompt, fresh | 1,207 | - | 13.3 s |
+| agent session, follow-up turns (3.7K -> 14.5K tokens) | 814-977 (the new tokens only) | 83.0 (66.1-93.1) | 3.43 s (1.77-3.60) |
+
+The agent session before the checkpoints and the attention kernel: 0% reused, first token 3.3 -> 13.0 s over
+the turns, decode 54 -> 27 tok/s; now 68% of the follow-up turns' tokens are reused (292 tokens per session
+read again: the prompt tails and the template's divergence), the first token takes 1.8-3.6 s and decode stays at
+74-90 tok/s at 14.5K tokens of context.
+
+Sampled requests through the same server (temperature 1.0, top-p 0.95, top-k 20, the user's llama.cpp
+settings): short chats 65-93 tok/s, the 3,197-token prompt 946-967 tok/s, 24 tokens after it 50-58 tok/s
+(greedy: 68-69); llama-server with the user's settings: 44-68, 546, 43.

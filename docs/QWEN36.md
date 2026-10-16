@@ -26,27 +26,55 @@ it starts and runs well on 8 GB cards, and on two of them.
   verified against the sampled distribution (exact: the text is a draw from the same sampler). The CPU pool runs
   nine row tasks per thread (`--pool-tasks`), with `--pool-affinity auto|p-cores|all` and `--pin-host yes|no`.
 
+- **Re-sent conversations.** A chat client resends the whole conversation every turn, and the template renders
+  the previous answer differently from the tokens the engine generated, so the held state was never an exact
+  extension and every turn re-read everything. serve() now keeps checkpoints of the recurrent state in host
+  memory (every GDN layer's conv history and state, ~63 MiB each, up to 8: after every full prompt chunk and 16
+  tokens before a prompt's end, where the next turn diverges) and restores the latest one at or before the
+  common prefix. Measured: a re-rendered follow-up after a 2,900-token prompt reads 31 tokens in 0.24 s instead
+  of 2,900 in 3.3 s. `STRATA_Q36_PROMPT_TAIL=0` reads prompts in one go as before.
+- **Long contexts.** The decode attention kernel read each cell's K row with one thread (32 scattered rows per
+  warp) and decoded at 32 tok/s after a 14K prompt. The default kernel now gives one block to a chunk of 256
+  cells and a kv head, reads its K and V once and scores the 8 query heads from them: 56-61 tok/s after a 14K
+  prompt (61-64 with drafts). Its summation order differs from upstream's, so greedy text can drift after a few
+  tokens; `STRATA_Q36_ATTN=v1` keeps upstream's kernel (bit-exact), `v2` the coalesced per-row one.
+
 Everything else (the prompt path, the hybrid mode's slots and their rebalancing, the MTP drafting for greedy
 requests) is upstream's.
 
 ## Measured on 2x RTX 2080 (8 GB) + i5-13400 + 32 GB DDR5-6000, UD-Q4_K_XL, 2026-10-16
 
 The second card is on a PCIe 3.0 x4 slot, the first on x16 and it drives the desktop. `--max-context 32768`,
-prompt chunk 2048 (the hybrid mode's), `--mtp 2`; the engine's own bench (3 repetitions, a random prompt), and
-llama.cpp (b11559) with the user's settings (`-ngl 999 --n-cpu-moe 32 -ts 3,1 -fa on -ctk q8_0 -ctv q8_0 -t 10`):
+prompt chunk 2048 (the hybrid mode's), `--mtp 2`, the config `./setup.sh --yes --family qwen36 --model UD-Q4_K_XL
+--gpus all` writes. The second card holds the last 6 layers and the MTP block with every expert resident
+(3.34 GiB), the first card 24 of 256 experts per layer in VRAM and the rest of its 34 layers' experts in a
+15.4 GiB pinned host arena. The stock engine does not start on an 8 GB card at all.
 
-| | Strata (this fork, two cards) | llama.cpp (two cards) |
+Through the server (`tools/strata_bench.py`, greedy, thinking off, medians of 3 runs):
+
+| test | prompt | decode | first token |
+| --- | ---: | ---: | ---: |
+| short chat (46-token prompts, 100 tokens out) | - | 79.9 tok/s (66.8-92.2) | 0.36 s |
+| 4K prompt, fresh | 1,216 tok/s | - | 3.3 s |
+| 16K prompt, fresh | 1,207 tok/s | - | 13.3 s |
+| agent session, turns 2-6 (3.7K to 14.5K tokens of context) | 814-977 tok/s over the new tokens, 68% reused | 83.0 tok/s (66-93) | 1.8-3.6 s |
+
+The same requests to llama.cpp (b11559) with the user's own settings (`--spec-type draft-mtp --spec-draft-n-max 3
+-ngl 999 -fa on -ctk q8_0 -ctv q8_0 --n-cpu-moe 32 -ts 3,1 -t 10`), both at temperature 1.0 / top-p 0.95 / top-k
+20, the servers' own timings:
+
+| request | this fork (two cards) | llama-server |
 | --- | ---: | ---: |
-| reads a 2,048-token prompt | 1,084 / 1,289 / 1,298 tok/s | 414 tok/s |
-| writes (greedy, one token at a time) | 55-67 tok/s | 45.0 tok/s |
-| writes (greedy, 2 MTP drafts) | 68-80 tok/s | - |
+| short chat, prose, 100 tokens | 65-84 tok/s | 44-48 tok/s |
+| short chat, code | 78-93 | 57-65 |
+| 3,197-token prompt (fresh) | 946-967 tok/s | 546 tok/s |
+| 24 tokens right after that prompt | 50-58 | 43 |
 
-The stock engine does not start on an 8 GB card at all (VRAM: 4.4 GiB of dense weights with the packed copies,
-then the buffers). With the split the second card holds the last 6 layers and the MTP block with every expert
-resident (3.34 GiB), the first card 24 of 256 experts per layer in VRAM and the rest of its 34 layers' experts in a
-15.4 GiB pinned host arena.
+The engine's own bench (`--bench-pp N --bench-tg 64`, 3 reps, random prompts; llama-bench the same way without
+drafts): a 2,048-token prompt 1,084 / 1,289 / 1,298 tok/s against 414; greedy decode 62-70 tok/s against 45.0;
+with 2 drafts 68-80. After a 14,000-token prompt: 56-61 tok/s (61-64 with drafts).
 
-Where a decoded token's time goes (nsys, eager decode): ~6.5 ms of GPU kernels (the Q8_0 dense GEMVs near the
+Where a decoded token's time goes (nsys, short context): ~6.5 ms of GPU kernels (the Q8_0 dense GEMVs near the
 card's bandwidth), ~5 ms on the CPU pool (32 us per missed expert, DRAM-bound), serialized by the layer
 dependency; ~2 ms of host overhead. Drafts amortize all of it.
 
