@@ -99,3 +99,62 @@ Parity (greedy text, 29-token prompt, 48 tokens with `--mtp 2`, `--expert-slots 
 so that the same experts are resident in every arm): the stock engine on one card, the new engine on one card
 (with the 256 MB and with the 64 MB attention buffers) and the new engine on two cards (`--layer-split 30`)
 produced the identical 48 tokens and the same 28 of 40 drafts accepted. The split is bit-exact.
+
+### Measured: the automatic split on 2x RTX 2080, by prompt chunk (engine bench, 3 reps, before the layer graphs)
+
+`CUDA_VISIBLE_DEVICES=0,1 build/strata --native <gguf> --max-context 32768 --mtp 2 --bench-pp 2048 --bench-tg 64`,
+the chunk decides the second card's room (its buffers scale with the chunk) and the first card's expert slots:
+
+| chunk | CUDA1 holds (all experts resident) | CUDA0 slots per layer | pp2048 (3 reps) | tg64 (3 reps) |
+| ---: | --- | ---: | ---: | ---: |
+| 2048 (auto) | layers 34-39 + MTP | 24 of 256 | 1084 / 1289 / 1298 tok/s | 55.4 / 55.0 / 56.9 tok/s |
+| 1024 | layers 33-39 + MTP | 33 of 256 | 620 / 700 / 700 | 57.2 / 59.0 / 60.5 |
+| 512 | layers 32-39 + MTP | 39 of 256 | 346 / 368 / - | 56.5 / 58.8 / - |
+
+llama.cpp (the user's settings): pp2048 414, tg64 45.0. The prompt is PCIe-bound (the first card streams its
+hybrid layers' experts once per chunk), so chunk 2048 stays the default. Decode: the CPU pool took 6.7 ms of the
+17.9 ms per token at chunk 2048 (217 of 272 routed entries per token on the pool); the other ~11 ms is the GPU
+side, of which the dense weights (1.5 GiB over both cards at 448 GB/s) are ~4.5 ms: the rest is per-layer launch
+and sync overhead, which is what the per-layer CUDA graphs (next) address.
+
+## 2026-10-16 - per-layer CUDA graphs: exact, but no faster; where a decoded token's time goes
+
+The hybrid decode now runs each layer as two graphs (the mixer + router + the routing's copies to the host; the
+resident and shared experts) with the CPU pool between them, and a stage tail graph (the last merge + combine, then
+the head or the hand-off); a layer whose experts are all resident is one graph. ~70 graph launches per token
+instead of ~700 kernel launches. Greedy text: identical to the eager path (48 tokens, 28 of 40 drafts accepted).
+A verify window of one row (the drafts are clamped at a rebalance boundary) must not reuse the decode step's graph
+(its GDN kernels write the state): the graphs are keyed by (verify, rows). `STRATA_Q36_NO_LAYER_GRAPH=1` or
+`--no-graph` restores the eager path.
+
+Measured (two cards, auto split, chunk 2048, tg64, 3 reps): graphs 47.8 / 49.7 / 53.6 tok/s against eager
+55.4 / 55.0 / 56.9 - no gain (within noise, if anything slower). An nsys profile of a short eager decode (pp16 +
+tg48, 3 reps, `--mtp 0`) says why: the GPU kernels of a token sum to ~6.5 ms (the Q8_0 dense GEMVs alone
+783 ms over the run, 25.6 us each on average: near the card's bandwidth), the CPU pool ~5 ms (32 us per routed
+expert entry), and they are serialized by the data dependency (a layer's combine needs the pool's rows before the
+next layer's mixer). Launch overhead was never the bottleneck; the host-side overhead outside the pool is ~2 ms.
+So decode on this PC is bounded by: GPU weight traffic (~1.5 GiB per token over both cards) + the CPU pool's
+DRAM traffic for the missed experts. The levers left: the hit rate (VRAM for slots), the pool's efficiency, the
+packed Q8_0 GEMV kernels where VRAM allows, and drafts (MTP) to amortize all of it: greedy with 2 drafts measured
+78.4 tok/s over 256 tokens (68% of drafts accepted) in the engine's `--tokens` mode, 79.6 tok/s on a 160-token
+`--serve` request.
+
+### Measured: pool tasks, pool affinity, sampled requests (two cards, auto split, chunk 2048, 32K context)
+
+Engine bench pp512 + tg64, 3 reps, and the same 64 tokens again with 2 MTP drafts (greedy):
+
+| pool setting | tg64 | tg64 with 2 drafts | pool time for the run |
+| --- | ---: | ---: | ---: |
+| default (10 threads, 3 tasks per thread) | 60.8 / 64.7 / 64.3 tok/s | 63.6 / 68.1 / 67.6 | 2410 ms |
+| `--pool-tasks 90` (9 per thread) | 62.0 / 67.3 / 67.3 | 67.3 / 72.3 / 71.8 | 2155 ms |
+| `--pool-affinity p-cores` (6 threads) | 52.8 / 66.8 / 64.5 | 54.2 / 68.1 / 69.2 | 2697 ms |
+
+Nine tasks per thread is the engine's default now (the E-cores' tail at each phase barrier shrinks); the E-cores
+stay in the pool (the P-cores alone read less of the DRAM bandwidth).
+
+Sampled requests through `--serve` (29-token prompt, 160 tokens, `temperature=1.0 top_p=0.95 top_k=20`, then
+`temperature=0.7`): one token at a time 63.8 / 73.0 tok/s; with the new speculative sampling (the MTP block's
+greedy drafts verified against the sampled distribution, exact) 68.5 / 76.3 tok/s, 49% / 53% of drafts accepted.
+The greedy request on the same prompt: 79.6 tok/s (62% accepted). The top-k of a sampled request is sorted on
+the device now (a radix sort of the 248,320 logits) instead of copying them to the host every token.
+`STRATA_Q8_PACKED=1` cannot start on one 8 GB card even at 8K context (the staging buffers do not fit).
