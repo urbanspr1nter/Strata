@@ -38,6 +38,12 @@ it starts and runs well on 8 GB cards, and on two of them.
   llama.cpp's q8_0 cache. 262K context fits on two 8 GB cards with it; 128K and 32K get more expert slots.
   Measured (engine bench, short chats): 32K 69-71 tok/s (82-107 with drafts), 128K 63-68 (94-97), 262K 58-61
   (76-79); after a 40,000-token prompt at 262K, 50-54 tok/s and the prompt read at 700-735 tok/s.
+- **Long prompts.** The prompt attention sliced a chunk's queries so that their scores over the whole prefix fit
+  a 64 MB buffer (10 rows a GEMM at 100K cells) and read the shared K and V once per query head. A prefix longer
+  than 16K cells is now read in 16K-cell key chunks with wide query slices, one GEMM per kv head for its 8 query
+  heads and an online softmax across the chunks. Measured: a 40,000-token prompt 700 -> 1,005-1,096 tok/s, a
+  98,600-token prompt 224 -> 807 tok/s, the continuation identical. `STRATA_Q36_PROMPT_KEY_CHUNK_OFF=1` keeps the
+  old path.
 - **Long contexts.** The decode attention kernel read each cell's K row with one thread (32 scattered rows per
   warp) and decoded at 32 tok/s after a 14K prompt. The default kernel now gives one block to a chunk of 256
   cells and a kv head, reads its K and V once and scores the 8 query heads from them: 56-61 tok/s after a 14K

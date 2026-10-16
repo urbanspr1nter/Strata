@@ -602,6 +602,66 @@ __global__ void k_attn_softmax16(const float* S, __half* S16, int ld, int T, int
     const float inv = 1.0f / sum;
     for (int p = threadIdx.x; p < P; p += blockDim.x) out[p] = __float2half(p < n ? expf(row[p] * scale - mx) * inv : 0.f);
 }
+/// The prompt's causal softmax over ONE key chunk (flash-style): row (h, t) of S (ld floats, n cells starting at
+/// cell c0) -> exp(s * scale - m_new) as FP16 for the visible cells (< pos_base + t + 1), 0 past them; m / l per
+/// (t, h) carried across the chunks (m_new = max(m_old, the chunk's max)), alpha = exp(m_old - m_new) rescales the
+/// accumulator.  A chunk with no visible cell for the row writes zeros and leaves m / l alone.  grid (nt, H), block 256.
+__global__ void k_attn_softmax_chunk(const float* S, __half* S16, int ld, int nt, int n, int c0, int pos_base,
+                                     float scale, int G, float* m_run, float* l_run, float* alpha) {
+    __shared__ float sh[kThreads];
+    const int t = blockIdx.x, h = blockIdx.y, H = gridDim.y;
+    const size_t r = (size_t) (h / G) * nt * G + (size_t) t * G + h % G;   // the grouped row order (kvh, t, g)
+    const float* row = S + r * ld;
+    __half* out = S16 + r * ld;
+    const int idx = t * H + h;
+    const int nv = min(n, max(0, pos_base + t + 1 - c0));   // this row's visible cells of the chunk
+    if (nv == 0) {
+        for (int p = threadIdx.x; p < n; p += blockDim.x) out[p] = __float2half(0.f);
+        if (threadIdx.x == 0) alpha[idx] = 1.f;
+        return;
+    }
+    const float mo = m_run[idx], lo = l_run[idx];
+    float mx = -INFINITY;
+    for (int p = threadIdx.x; p < nv; p += blockDim.x) mx = fmaxf(mx, row[p] * scale);
+    mx = block_max(mx, sh);
+    const float mn = fmaxf(mo, mx);
+    float sum = 0.f;
+    for (int p = threadIdx.x; p < nv; p += blockDim.x) sum += expf(row[p] * scale - mn);
+    sum = block_sum(sum, sh);
+    for (int p = threadIdx.x; p < n; p += blockDim.x) out[p] = __float2half(p < nv ? expf(row[p] * scale - mn) : 0.f);
+    if (threadIdx.x == 0) {
+        const float a = mo == -INFINITY ? 0.f : expf(mo - mn);
+        m_run[idx] = mn;
+        l_run[idx] = lo * a + sum;
+        alpha[idx] = a;
+    }
+}
+/// The slice's queries regrouped by kv head for one GEMM per kv head: qg[(kvh * nt + t) * G + g][:] =
+/// q16[(t0 + t) * H + kvh * G + g][:] (then K is read once for the G query heads, not once per head as a batched
+/// GEMM over the heads does), n = nt * H * HD values.
+__global__ void k_q_group(const __half* q16, __half* qg, int t0, int nt, int H, int G, int HD, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int d = (int) (i % HD), r = (int) (i / HD);   // r = (kvh * nt + t) * G + g
+    const int g = r % G, t = (r / G) % nt, kvh = r / (G * nt);
+    qg[i] = q16[((size_t) (t0 + t) * H + kvh * G + g) * HD + d];
+}
+/// acc[t][h][:] = acc * alpha[t][h] + part[(kvh * nt + t) * G + g][:] (the chunk's P V product in the grouped
+/// order, h = kvh * G + g), n = nt * H * HD values.
+__global__ void k_attn_acc(float* acc, const float* part, const float* alpha, int nt, int H, int G, int HD, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int d = (int) (i % HD), t = (int) (i / ((int64_t) H * HD)), h = (int) ((i / HD) % H);
+    const int kvh = h / G, g = h % G;
+    acc[i] = acc[i] * alpha[t * H + h] + part[((size_t) (kvh * nt + t) * G + g) * HD + d];
+}
+/// att[t][h][:] = acc / l[t][h] * sigmoid(gate) (the softmax's denominator and the output gate), n values.
+__global__ void k_attn_fin(const float* acc, const float* l, const float* gate, float* att, int H, int HD, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int t = (int) (i / ((int64_t) H * HD)), h = (int) ((i / HD) % H);
+    att[i] = acc[i] / l[t * H + h] * sigm(gate[i]);
+}
 /// att *= sigmoid(gate) (the attention output gate), n values.
 __global__ void k_gate_mul(float* att, const float* gate, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -735,6 +795,11 @@ __global__ void k_sum_splits(const float* part, float* out, int64_t n, int split
     out[i] = a;
 }
 
+/// x[i] = v for n values.
+__global__ void k_fill(float* x, float v, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = v;
+}
 /// x f32 -> FP16 bits (the prompt GEMMs' activations).
 __global__ void k_to_f16(const float* x, __half* y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -1395,6 +1460,14 @@ struct Stage {
     __half* att_p16 = nullptr;         // the probabilities in FP16 (kAttScoreFloats halves)
     __half *k16 = nullptr, *v16 = nullptr, *q16 = nullptr;   // the prompt attention's FP16 operands
     size_t kAttScoreFloats = (size_t) 64 << 20;   // 256 MB (16 M floats on a small card, or when the experts' fit is close)
+    // the prompt attention over a long prefix, flash-style: the keys in chunks of kAttKeyChunk cells so that the
+    // query slices stay wide (0.1.44 sliced the queries so that a slice's scores over the WHOLE prefix fit the
+    // buffer: 10 rows a GEMM at 100K cells); the running max / sum per (row, head), the rescale factor, and the
+    // chunk's P V product before it is folded into the accumulator (`att`)
+    static constexpr int kAttKeyChunk = 16384;
+    int att_tq_chunk = 0;              // query rows a slice takes on the chunked path
+    float *att_m = nullptr, *att_l = nullptr, *att_alpha = nullptr, *att_part = nullptr;
+    __half* att_qg = nullptr;          // the slice's queries grouped by kv head
     // the prompt's MMQ experts
     bool use_mmq = false;
     std::unique_ptr<MMQ::Context> mctx;
@@ -1535,6 +1608,12 @@ struct Stage {
         att_s = dalloc(kAttScoreFloats);
         sk_part = dalloc((size_t) kSplitK * T * (g.n_expert + 1));
         att_p16 = dalloc_t<__half>(kAttScoreFloats);
+        att_tq_chunk = (int) std::max<size_t>(1, std::min<size_t>(T, kAttScoreFloats / ((size_t) g.n_head * kAttKeyChunk)));
+        att_m = dalloc(T * (size_t) g.n_head);
+        att_l = dalloc(T * (size_t) g.n_head);
+        att_alpha = dalloc(T * (size_t) g.n_head);
+        att_part = dalloc((size_t) att_tq_chunk * g.n_head * g.head_dim);
+        att_qg = dalloc_t<__half>((size_t) att_tq_chunk * g.n_head * g.head_dim);
         k16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
         v16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
         q16 = dalloc_t<__half>(T * g.n_head * g.head_dim);
@@ -1861,6 +1940,56 @@ struct Stage {
                 else
                     k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, ctx, P, HD, HKV);
                 k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
+                static const bool chunked = std::getenv("STRATA_Q36_PROMPT_KEY_CHUNK_OFF") == nullptr;
+                if (chunked && P > kAttKeyChunk) {
+                    // the keys in chunks: wide query slices, the softmax carried across the chunks (online), the
+                    // chunk's P V product folded into the accumulator with the rescale factor
+                    const int tqc = att_tq_chunk;
+                    const float scale = 1.0f / sqrtf((float) HD);
+                    for (int t0 = 0; t0 < T; t0 += tqc) {
+                        const int nt = std::min(tqc, T - t0);
+                        const int last_vis = (int) p0 + t0 + nt;   // cells < last_vis are visible to some row of the slice
+                        float* Oacc = att + ((size_t) t0 * H) * HD;
+                        CK(cudaMemsetAsync(Oacc, 0, (size_t) nt * H * HD * 4, st));
+                        CK(cudaMemsetAsync(att_l, 0, (size_t) nt * H * 4, st));
+                        k_fill<<<grid1((int64_t) nt * H), kThreads, 0, st>>>(att_m, -INFINITY, (int64_t) nt * H);
+                        k_q_group<<<grid1((int64_t) nt * H * HD), kThreads, 0, st>>>(q16, att_qg, t0, nt, H, G, HD,
+                                                                                     (int64_t) nt * H * HD);
+                        for (int c0 = 0; c0 < last_vis; c0 += kAttKeyChunk) {
+                            const int n = std::min(kAttKeyChunk, P - c0);
+                            const int ldc = (n + 7) / 8 * 8;
+                            const int rows = nt * G;   // a kv head's query rows: (t, g)
+                            for (int kvh = 0; kvh < HKV; ++kvh) {   // scores [rows][ldc] = Qg . K^T, K read once for the group
+                                const __half* Kh = k16 + ((size_t) kvh * P + c0) * HD;
+                                const __half* Qg = att_qg + (size_t) kvh * rows * HD;
+                                float* Sh = att_s + (size_t) kvh * rows * ldc;
+                                if (cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, n, rows, HD, &one, Kh, CUDA_R_16F, HD, Qg, CUDA_R_16F,
+                                                 HD, &zero, Sh, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                                    CUBLAS_STATUS_SUCCESS) {
+                                    std::fprintf(stderr, "strata-q36: attention scores GEMM failed\n");
+                                    std::exit(1);
+                                }
+                            }
+                            k_attn_softmax_chunk<<<dim3(nt, H), kThreads, 0, st>>>(att_s, att_p16, ldc, nt, n, c0, (int) p0 + t0,
+                                                                                   scale, G, att_m, att_l, att_alpha);
+                            for (int kvh = 0; kvh < HKV; ++kvh) {   // part [rows][HD] = P . V, V read once for the group
+                                const __half* Vh = v16 + ((size_t) kvh * P + c0) * HD;
+                                const __half* Sh = att_p16 + (size_t) kvh * rows * ldc;
+                                float* Oh = att_part + (size_t) kvh * rows * HD;
+                                if (cublasGemmEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, rows, n, &one, Vh, CUDA_R_16F, HD, Sh, CUDA_R_16F,
+                                                 ldc, &zero, Oh, CUDA_R_32F, HD, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                                    CUBLAS_STATUS_SUCCESS) {
+                                    std::fprintf(stderr, "strata-q36: attention values GEMM failed\n");
+                                    std::exit(1);
+                                }
+                            }
+                            k_attn_acc<<<grid1((int64_t) nt * H * HD), kThreads, 0, st>>>(Oacc, att_part, att_alpha, nt, H, G, HD,
+                                                                                         (int64_t) nt * H * HD);
+                        }
+                        k_attn_fin<<<grid1((int64_t) nt * H * HD), kThreads, 0, st>>>(Oacc, att_l, gate + ((size_t) t0 * H) * HD, Oacc,
+                                                                                     H, HD, (int64_t) nt * H * HD);
+                    }
+                } else
                 for (int t0 = 0; t0 < T; t0 += tq) {
                     const int nt = std::min(tq, T - t0);
                     for (int kvh = 0; kvh < HKV; ++kvh) {
@@ -1890,7 +2019,8 @@ struct Stage {
                         }
                     }
                 }
-                k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, gate, (int64_t) T * H * HD);
+                if (!(chunked && P > kAttKeyChunk))   // (the chunked path applied the gate in k_attn_fin)
+                    k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, gate, (int64_t) T * H * HD);
             } else {
                 // split-K over 256-cell chunks; the chunk grid covers every cell a row can see (graph mode: the whole
                 // context, past-the-end chunks return at once)

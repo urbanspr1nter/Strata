@@ -371,3 +371,30 @@ choice (20 slots: 94-97 tok/s with drafts in short chats).
 - **Not on this path at all:** several requests at once (`--batch` / `"parallel"`), images (the family's mmproj is
   not wired up), the conversation cache's session files, rope scaling past 262K, the AMD build (guarded, not
   built here), Windows (not built here).
+
+## 2026-10-16 - more measurements, and the prompt attention over long prefixes
+
+Measured first (two cards, 128K, 8-bit KV, engine bench): three drafts instead of two lose (tg64 68.7 / 57.5 /
+68.3 tok/s with 3 drafts against 94-97 with 2: the acceptance per draft falls and the extra rows cost the pool);
+`--chunk 1024` gives the first card 30 slots instead of 20 for +5% on the drafted decode (102 / 99 / 103) at half
+the prompt rate (620-696), `--chunk 512` 34 slots for no further gain; the packed Q8_0 GEMV copies take more
+slots than they are worth on one 8 GB card (1 slot with them, 27 without: tg64 53-59 against 57-75). The defaults
+stay: `--mtp 2`, chunk 2048, no packed copies.
+
+**Prompt attention, flash-style.** The prompt path sliced a chunk's queries so that a slice's scores over the WHOLE
+prefix fit the 64 MB scores buffer: 10 query rows a GEMM at 100K cells, and the batched GEMM over a kv head's 8
+query heads read K and V once per head (stride 0). Now a prefix longer than 16K cells is read in key chunks of
+16K: a query slice of up to 60 rows (per 16 M floats of scores), the 8 query heads of a kv head stacked into one
+GEMM (`k_q_group`), the softmax carried across the chunks (online: running max and sum per row and head, the
+accumulator rescaled per chunk), the gate applied at the end. A prefix of at most 16K cells keeps the old path
+(bit-identical regression for short prompts); `STRATA_Q36_PROMPT_KEY_CHUNK_OFF=1` restores the old path for any
+prefix.
+
+| prompt (two cards, `--mtp 2`, 8-bit KV) | before | key chunks | + the grouped GEMM |
+| --- | ---: | ---: | ---: |
+| 20,300 tokens, 128K context | 1,182 tok/s | 1,188 | 1,232 (the 24 tokens after it identical in all three) |
+| 40,000 tokens, 262K context (bench, 3 reps) | 699 / 735 / 735 | 848 / 899 / 902 | 1,005 / 1,094 / 1,096 |
+| 98,600 tokens, 262K context (serve protocol, one run) | 224 tok/s (440 s) | - | 807 tok/s (122 s), the 8 tokens after it identical |
+
+(The 98K prompt went through the serve protocol: a 98,600-token id list is longer than the kernel's limit for
+one command-line argument.)
