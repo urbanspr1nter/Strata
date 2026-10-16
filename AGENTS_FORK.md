@@ -295,3 +295,18 @@ restores the tail checkpoint at 100 and reproduces the identical greedy continua
 layers on the second card (33-39 + MTP) and leaves 25 slots per layer on the first. Engine bench, chunk 2048,
 32K context: pp2048 1,195 / 1,298 / 1,300 tok/s, tg64 65.0 / 68.3 / 68.2, with 2 drafts 93.6 / 97.7 / 87.8
 (40 of 48 accepted); after a 14,000-token prompt tg32 52-62, with drafts 59-65.
+
+## 2026-10-16 - contexts beyond 32K; a fresh clone set up from scratch
+
+Engine bench on the two cards, pp2048 + tg64, `--mtp 2`: at `--max-context 65536` the split keeps 6 layers on the
+second card and 6 slots per layer on the first (the fp32 KV cache takes the slot room): pp2048 1,110 / 1,289 /
+1,297 tok/s, tg64 59.3 / 63.2 / 63.1, with drafts 70.1 / 71.7 / 72.1. At 131072 the start fails (`cudaMalloc ...
+out of memory` for the KV cache on the first card): this engine path stores K and V as fp32 (45 KB per token,
+11 GiB at 262K). llama.cpp reaches 262K on this PC with its q8_0 KV cache (~11 KB per token). An 8-bit KV cache
+for this path is the next step.
+
+A fresh `git clone -b fork/2080x2` into another folder, `./setup.sh --yes --family qwen36 --model UD-Q4_K_XL
+--no-start --data-dir <the data folder>`: both cards chosen by default, no RAM question (the family's RAM need is
+28 GB now: measured 15.4 GiB pinned with two cards), the engine compiled from the clone (no ready-made engine for
+0.1.44.1), the two-card config and run script written; its server loaded and answered a chat request. Nothing
+else was running at the time (two instances would each need an arena and the cards).
