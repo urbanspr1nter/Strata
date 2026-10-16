@@ -68,3 +68,34 @@ two cards), 3 repetitions:
 | tg64 | 45.0 ± 0.7 tok/s |
 
 Target of this fork: beat both numbers clearly, with the stock engine's quality (same weights, same math).
+
+## 2026-10-16 - design: a two-card layer split for the Qwen3.6 engine path
+
+Why a layer split and not a second expert tier: the second RTX 2080 sits on a PCIe 3.0 x4 slot (~3 GB/s) with no
+peer-to-peer, so anything streamed through it per prompt chunk is 4x slower than on the first card. With a layer
+split the last layers live entirely on the second card (their dense weights, KV cache, expert slots), it streams
+nothing when all of their experts are resident, and the residual crosses once per batch (8 KiB per row) through
+pinned host memory. The CPU pool stays shared. Flash-Next's own split (docs/MULTI_GPU.md) is the same shape.
+
+What changed in `src/qwen35/q36_engine.cu` (the single-device `Engine` became `Stage`, one per card, driven by a
+new `Engine`):
+
+- `--layer-split auto|K|0` and `--split-device D`. `auto` (the default whenever two GPUs are visible) prices the
+  second card's free VRAM with the file's tensor sizes and takes the largest trailing block of layers whose experts,
+  dense weights, KV cache (at `--max-context`), the output head, the MTP block and the chunk's buffers all fit, so
+  every expert of those layers is resident there. K puts layers K.. on the second card by hand.
+- Each stage allocates only its own layers' state and buffers; the MTP block, output head and logits are on the
+  last stage. Expert placement is per stage (all-resident or hybrid with its own slot count and staging buffers);
+  the host arena is one `cudaHostAllocPortable` block so both cards' copy engines read it.
+- VRAM diet (both cards): the token-embedding table stays in host memory (515 MiB saved; a batch's rows are
+  staged through pinned memory), the attention-scores buffers are 64 + 32 MB on a card under 12 GB (shrunk by
+  `shrink_att` before only in one corner case), the split-K attention partials are sized for the <= 8-row batches
+  that use them (16 MiB instead of 128 MiB at 32K), the hybrid buffers are sized by the hybrid batch (128 rows)
+  instead of the chunk (2048), and the packed Q8_0 decode copies (1.8 GiB) are off by default on a card under
+  20 GB (`STRATA_Q8_PACKED=1` turns them on).
+- The MTP draft step runs as a CUDA graph when the MTP block's experts are resident, even in the hybrid mode.
+
+Parity (greedy text, 29-token prompt, 48 tokens with `--mtp 2`, `--expert-slots 13` and `STRATA_Q36_FIXED_SLOTS=1`
+so that the same experts are resident in every arm): the stock engine on one card, the new engine on one card
+(with the 256 MB and with the 64 MB attention buffers) and the new engine on two cards (`--layer-split 30`)
+produced the identical 48 tokens and the same 28 of 40 drafts accepted. The split is bit-exact.
