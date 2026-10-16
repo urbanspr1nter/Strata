@@ -1,7 +1,7 @@
 """Tests for setup.py's Qwen3.6-35B-A3B install (a family with its own engine path: OWN_PATH_FAMILIES): the pinned and
 hashed files, the menu entry, steps 2-7 of install_own_path (size, context, the engine's --families check, the
-download, the tokenizer, the config) and reading such a config back.  Mocked engine, downloads and processes -
-nothing is built, fetched or started.
+download, the tokenizer, the config, two GPUs as a layer split) and reading such a config back.  Mocked engine,
+downloads and processes - nothing is built, fetched or started.
 
     python -m unittest tools.test_setup_qwen36
 """
@@ -30,7 +30,8 @@ REPO = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
 def args(**kw):
     base = dict(family="qwen36", model=None, check=False, yes=True, vision=None, models_dir=None, gguf_dir=None,
                 context=None, rope_scaling=None, rope_scale=None, kv=None, resident_budget_gib=None, low_ram="auto",
-                vram_reserve_mib=None, host=None, api_key=None, browser=None, no_start=True, data_dir=None, gpu=None)
+                vram_reserve_mib=None, host=None, api_key=None, browser=None, no_start=True, data_dir=None, gpu=None,
+                layer_split=None)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -115,10 +116,11 @@ class InstallOwnPath(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def install(self, ram=64.0, vram=16.0, **kw):
-        gpu = {"index": 0, "count": 1, "vram_gb": vram, "name": "Test GPU"}
+    def install(self, ram=64.0, vram=16.0, gpus=(0,), multi=(), **kw):
+        # gpus: the PC's cards, the main one first (as main() hands them over); multi: the cards chosen together
+        gpu = {"index": gpus[0], "count": len(gpus), "vram_gb": vram, "name": "Test GPU"}
         return run(setup.install_own_path, args(models_dir=str(self.root / "models"), **kw), "qwen36", gpu, False, [],
-                   13, [], 8080, ram, None)
+                   13, list(multi), 8080, ram, None)
 
     def test_installs_the_pinned_file_and_writes_the_config(self):
         rc, out = self.install(model="UD-Q4_K_XL")
@@ -183,14 +185,57 @@ class InstallOwnPath(unittest.TestCase):
         self.assertEqual(a[a.index("--max-context") + 1], "131072")
         self.assertIn("images are not available", out)
 
+    def test_two_gpus_split_the_layers(self):
+        # the config a Flash-Next install writes for two cards: the cards and "layer_split": "auto" (the server adds
+        # --layer-split; the engine places the split itself)
+        rc, out = self.install(model="UD-Q4_K_XL", gpus=(0, 1), multi=(0, 1), gpu=0)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((self.cfg["gpu"], self.cfg["layer_split"]), ([0, 1], "auto"))
+        self.assertTrue(self.cfg["gpus_asked"])
+        self.assertNotIn("--layer-split", self.cfg["args"])
+        self.assertNotIn("runs on one GPU", out)
+        self.assertIn("layer split across GPUs [0, 1] (auto)", out)
+        self.assertIn("the second card takes the last layers it can hold", out)
+        # the chosen order is the engine's: the first card runs the first layers
+        self.install(model="UD-Q4_K_XL", gpus=(1, 0), multi=(1, 0), gpu=1)
+        self.assertEqual(self.cfg["gpu"], [1, 0])
+        # a split point given by hand (layers 30.. on the second card) is kept as given
+        rc, out = self.install(model="UD-Q4_K_XL", gpus=(0, 1), multi=(0, 1), gpu=0, layer_split="30")
+        self.assertEqual(self.cfg["layer_split"], "30")
+        self.assertIn("layer split across GPUs [0, 1] (30)", out)
+        self.assertNotIn("the second card takes", out)
+
+    def test_a_third_gpu_is_left_out(self):
+        rc, out = self.install(model="UD-Q4_K_XL", gpus=(0, 1, 2), multi=(0, 1, 2), gpu=0)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("runs on two GPUs so far: using GPU 0 and GPU 1 only (--gpus 0,1,2)", out)
+        self.assertEqual((self.cfg["gpu"], self.cfg["layer_split"]), ([0, 1], "auto"))
+
+    def test_one_gpu_as_before(self):
+        rc, out = self.install(model="UD-Q4_K_XL", gpus=(1, 0), gpu=1)      # --gpu 1 on a two-card PC
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cfg["gpu"], 1)
+        self.assertTrue(self.cfg["gpus_asked"])
+        self.assertNotIn("layer_split", self.cfg)
+        self.assertNotIn("layer split", out)
+        self.assertNotIn("runs on", out)
+        self.install(model="UD-Q4_K_XL")                                   # one card, not chosen: no "gpu" at all
+        self.assertNotIn("gpu", self.cfg)
+
     def test_config_read_back(self):
         self.install(model="UD-Q6_K_XL", context=65536)
         p = self.root / "strata-qwen36-ud-q6_k_xl.json"
         p.write_text(json.dumps(self.cfg), encoding="utf-8")
         ch = setup.choices_from_config(p)
         self.assertEqual((ch["family"], ch["model"], ch["context"]), ("qwen36", "UD-Q6_K_XL", 65536))
+        self.assertIsNone(ch["layer_split"])
         self.assertTrue(setup.own_path_config(self.cfg))
         self.assertEqual(setup.calibration_targets([p], None, None), [])   # the tuning is Flash-Next's
+        # a two-card config reads back with its cards and split: a re-run, or a copy set up like it, keeps them
+        self.install(model="UD-Q6_K_XL", context=65536, gpus=(0, 1), multi=(0, 1), gpu=0)
+        p.write_text(json.dumps(self.cfg), encoding="utf-8")
+        ch = setup.choices_from_config(p)
+        self.assertEqual((ch["gpu"], ch["layer_split"]), ([0, 1], "auto"))
 
 
 if __name__ == "__main__":

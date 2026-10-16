@@ -426,9 +426,10 @@ MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # Qwen3.6-35B-A3B (GGUF architecture qwen35moe), Unsloth's GGUFs with the MTP block: a family with an engine path of its
 # own (src/qwen35; `strata` switches to it from the file's architecture).  No pack, no expert profile, no separate MTP
 # draft layer: the engine reads the GGUF as it is, keeps every expert it can in VRAM and computes the rest on the CPU
-# (the hybrid mode), and drafts with the file's own MTP block.  Not in FAMILIES (whose entries are Flash-Next files with
-# packs): OWN_PATH_FAMILIES, offered in the same menu and installed by install_own_path.  NVIDIA (CUDA) and AMD (HIP)
-# only: the Intel Arc (SYCL) engine refuses it.
+# (the hybrid mode), and drafts with the file's own MTP block.  On two GPUs it splits the layers itself (--layer-split
+# auto: the last layers the second card can hold with every one of their experts; a third card has no stage yet).  Not
+# in FAMILIES (whose entries are Flash-Next files with packs): OWN_PATH_FAMILIES, offered in the same menu and installed
+# by install_own_path.  NVIDIA (CUDA) and AMD (HIP) only: the Intel Arc (SYCL) engine refuses it.
 QWEN36_FILES = {
     "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf": (22853663008, "55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1"),
     "Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf": (32611711264, "35fce994cd36104a7dc1bd8a4bdf13778145664c00fdef6773aebc9246e5019c"),
@@ -4577,7 +4578,7 @@ def choices_from_config(cfg_path: Path) -> dict:
         ctx = a[a.index("--max-context") + 1] if "--max-context" in a and a.index("--max-context") + 1 < len(a) else None
         return {"family": own, "model": size, "context": int(ctx) if ctx and ctx.isdigit() else None, "kv": None,
                 "vision": "none", "esp": "off", "host": cfg.get("host"), "api_key": cfg.get("api_key"),
-                "port": cfg.get("port"), "gpu": cfg.get("gpu"), "layer_split": None,
+                "port": cfg.get("port"), "gpu": cfg.get("gpu"), "layer_split": cfg.get("layer_split"),
                 "cuda": 12 if config_toolkit(cfg) == 12 else None, "vram_reserve_mib": None}
     family = next((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])), "qwen")
     model = (tag[len(FAMILIES[family]["tag"]):] if tag.startswith(FAMILIES[family]["tag"]) else tag).upper()
@@ -5531,15 +5532,20 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     """Steps 2-7 for a family with its own engine path (OWN_PATH_FAMILIES: Qwen3.6-35B-A3B): the size, the context, the
     engine, the GGUF (pinned revision, size and SHA-256), the tokenizer from the GGUF, the config and the start
     script.  The engine places the experts itself (every one in VRAM when they fit, else the most-used ones there and
-    the rest on the CPU), so there is no pack, profile or RAM budget to choose."""
+    the rest on the CPU), so there is no pack, profile or RAM budget to choose.  Two GPUs (--gpus, or chosen in the
+    menu) are written as for a Flash-Next model ("gpu": the cards, "layer_split": "auto"; the server adds the flag):
+    the engine prices the second card's free VRAM itself and puts the last layers it can hold there, every one of
+    their experts resident - it needs no profile or any other input for it.  A third card has no stage yet."""
     fam = OWN_PATH_FAMILIES[family]
     say()
     say(f"  {fam['title']} - {fam['by']}: {fam['about']}")
     ok(f"model: {fam['title']}")
     if fam.get("license"):
         say(f"  Its license: {fam['license']}")
-    if multi:
-        warn(f"{fam['title']} runs on one GPU so far: using GPU {gpu.get('index', 0)} ({gpu_name(gpu)}) only")
+    if len(multi) > 2:                                 # the engine has two stages so far: a third card has none
+        warn(f"{fam['title']} runs on two GPUs so far: using GPU {multi[0]} and GPU {multi[1]} only (--gpus "
+             + ",".join(str(i) for i in multi) + ")")
+        multi = multi[:2]
     names = list(fam["models"])
     if a.model and a.model not in names:
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
@@ -5637,6 +5643,13 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     if gpu.get("count", 1) > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]
         cfg["gpus_asked"] = True
+    if multi:                                          # a layer split across these cards (the server adds the flag)
+        cfg["gpu"] = multi
+        cfg["layer_split"] = a.layer_split or "auto"
+        ok(f"layer split across GPUs {multi} ({cfg['layer_split']})")
+        if cfg["layer_split"] == "auto":
+            say("  The engine sizes it at start: the second card takes the last layers it can hold with every one of")
+            say("  their experts; the first card runs the rest (its experts that do not fit stay on the CPU).")
     if a.host:
         cfg["host"] = a.host
     if a.api_key:

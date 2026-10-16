@@ -2267,6 +2267,34 @@ class LayerSplit(unittest.TestCase):
                          ["--native", "x"])
 
 
+class OwnPathSplit(unittest.TestCase):
+    """Qwen3.6-35B-A3B ("arch": "qwen35moe", the engine path of its own) on two cards: the config setup writes for it
+    ("gpu": [0, 1], "layer_split": "auto") starts the engine on both cards, in the given order, with --layer-split
+    auto.  The engine places the split itself (the last layers on the second visible card), so nothing else is
+    passed: no expert profile, no PCIe probe, no skip-if-fits."""
+
+    ARGS = ["--native", "q.gguf", "--max-context", "32768", "--prefill", "auto", "--mtp", "2"]
+    CFG = {"exe": "engine/strata", "args": ARGS, "arch": "qwen35moe", "gpu": [0, 1], "layer_split": "auto"}
+
+    def test_both_cards_in_the_given_order_with_the_flag(self):
+        from serve.server import child_env, layer_split_of, ordered_gpus
+        two_2080 = {0: 46.0 * 1710, 1: 46.0 * 1710}              # equal cards (two RTX 2080): the order stays
+        self.assertEqual(ordered_gpus(self.CFG, two_2080), [0, 1])
+        self.assertEqual(ordered_gpus({**self.CFG, "gpu": [1, 0]}, two_2080), [1, 0])
+        with mock.patch("serve.server.gpu_speed_scores", lambda gl: two_2080):
+            env = child_env(self.CFG)
+        self.assertEqual((env["CUDA_VISIBLE_DEVICES"], env["CUDA_DEVICE_ORDER"]), ("0,1", "PCI_BUS_ID"))
+        self.assertTrue(layer_split_of(self.CFG))
+        self.assertEqual(engine_args(self.CFG), self.ARGS + ["--layer-split", "auto"])
+        self.assertEqual(engine_args({**self.CFG, "layer_split": "30"}), self.ARGS + ["--layer-split", "30"])
+
+    def test_one_card_as_before(self):
+        from serve.server import child_env
+        one = {"exe": "engine/strata", "args": self.ARGS, "arch": "qwen35moe", "gpu": 0, "gpus_asked": True}
+        self.assertEqual(engine_args(one), self.ARGS)
+        self.assertEqual(child_env(one)["CUDA_VISIBLE_DEVICES"], "0")
+
+
 class DraftHeadHint(unittest.TestCase):
     """#474: a start that stopped at "the draft head does not fit" says what to change, from this start's log lines."""
 
