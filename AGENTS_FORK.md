@@ -257,3 +257,41 @@ read again: the prompt tails and the template's divergence), the first token tak
 Sampled requests through the same server (temperature 1.0, top-p 0.95, top-k 20, the user's llama.cpp
 settings): short chats 65-93 tok/s, the 3,197-token prompt 946-967 tok/s, 24 tokens after it 50-58 tok/s
 (greedy: 68-69); llama-server with the user's settings: 44-68, 546, 43.
+
+## 2026-10-16 - a review of the engine changes (four readers, two skeptics per finding), and the fixes
+
+Twelve findings; the skeptics confirmed ten by reading the code. Fixed in the same commit as this entry:
+
+- A last stage placed "MTP block only on the pool" beside a hybrid first stage inherited the engine-wide
+  `main_hybrid` and streamed the MTP block's prompt pass through staging buffers it never allocated (exit at
+  warm-up). Each stage's `main_hybrid` now follows its own plan; such a stage runs every batch on the hybrid rows
+  path, as the single-card mtp_only placement does.
+- serve() dropped the kept drafts after the one that ended an answer from `live`, although the engine had
+  committed them all: a later request extending that text would have reused a state one or more tokens ahead.
+  The kept drafts go into `live` before any of them is emitted.
+- The per-layer graph path took every verify window up to 8 rows, but the hybrid buffers hold `--hybrid-rows`
+  rows (128 by default; a smaller value would have overrun them): gated on the hybrid batch size too, and the
+  buffers hold at least 8 rows.
+- With no draft left before a rebalance boundary, the verify window's staging (the embedding rows, the position
+  word) could be rewritten while the MTP call's uploads were still queued on the same card: a stream sync there.
+- The AMD (HIP) build has no CUB: the device sort and the speculative sampling are CUDA-only; HIP keeps
+  upstream's host sampling (not built here: no ROCm on this PC).
+- The chunk rule credited the packed Q8_0 copies as returnable on two cards, where they never are.
+- The DONE line's offered-drafts count used the full `--mtp` even when the step clamped it.
+- setup: three cards with a two-point `--layer-split` kept both points after the list was cut to two cards (the
+  server refuses such a config): "auto" with a note.
+- The split planner priced the chunk's buffers per row with tile-padded sizes that init allocates once per batch,
+  so it left a layer the second card could hold: priced per batch now.
+
+Two findings were refuted (the planner's pricing order; a staging race that the hybrid MTP layer's host wait
+already covers) and two are accepted as is: the greedy text of a prompt's last 16 tokens is not bit-identical to
+upstream's (the hybrid rows path instead of the streamed MMQ path), and the attention kernel's sum order (see
+above, `STRATA_Q36_ATTN=v1` restores both... the kernel only; `STRATA_Q36_PROMPT_TAIL=0` the prompt path).
+
+Verified after the fixes (two cards): `STRATA_Q36_ATTN=v1` still reproduces the upstream 48-token greedy text;
+`--layer-split 25` (both stages hybrid: 48 and 80 slots per layer) runs; a drafted answer that ends inside a kept
+window followed by its exact extension reuses every committed token (157 of 160; the same request again
+restores the tail checkpoint at 100 and reproduces the identical greedy continuation). The planner now takes 7
+layers on the second card (33-39 + MTP) and leaves 25 slots per layer on the first. Engine bench, chunk 2048,
+32K context: pp2048 1,195 / 1,298 / 1,300 tok/s, tg64 65.0 / 68.3 / 68.2, with 2 drafts 93.6 / 97.7 / 87.8
+(40 of 48 accepted); after a 14,000-token prompt tg32 52-62, with drafts 59-65.

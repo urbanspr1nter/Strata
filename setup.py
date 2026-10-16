@@ -5546,6 +5546,9 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         warn(f"{fam['title']} runs on two GPUs so far: using GPU {multi[0]} and GPU {multi[1]} only (--gpus "
              + ",".join(str(i) for i in multi) + ")")
         multi = multi[:2]
+        if a.layer_split and "," in str(a.layer_split):   # a split point per dropped card: the engine sizes it
+            warn(f"--layer-split {a.layer_split} names more than one split point: using auto")
+            a.layer_split = "auto"
     names = list(fam["models"])
     if a.model and a.model not in names:
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))

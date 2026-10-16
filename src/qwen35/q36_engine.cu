@@ -35,7 +35,12 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <cub/cub.cuh>
+#if !defined(__HIP_PLATFORM_AMD__)
+#include <cub/cub.cuh>   // the device sort of the sampled path (the HIP build samples from the host as 0.1.44)
+#define STRATA_Q36_DEVICE_TOPK 1
+#else
+#define STRATA_Q36_DEVICE_TOPK 0
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -982,7 +987,7 @@ float* upload_f32(const strata::TensorInfo& t, const uint8_t* src) {
     return d;
 }
 
-size_t stage_row_bytes(const strata::core::ModelGeometry& g, int64_t top_k, bool use_mmq);
+size_t stage_batch_bytes(const strata::core::ModelGeometry& g, int64_t top_k, bool use_mmq, size_t T);
 constexpr size_t kMmqTail = 4096;
 
 /// How the layers are shared between two cards (--layer-split): `k` the first layer of the second card (0: one
@@ -1034,7 +1039,7 @@ int plan_split(const strata::GgufModel& gm, const Model& m, const SplitSpec& sp)
     }
     const size_t n_chunk = ((size_t) sp.ctx + kChunkCells - 1) / kChunkCells;
     size_t fixed = (size_t) 768 << 20;                                                   // the reserve
-    fixed += stage_row_bytes(g, m.top_k, true) * (size_t) sp.tmax_est;                   // the chunk's buffers
+    fixed += stage_batch_bytes(g, m.top_k, true, (size_t) sp.tmax_est);                  // the chunk's buffers
     fixed += (size_t) (sp.small ? 16 << 20 : 64 << 20) * 6;                              // the attention scores
     fixed += 2 * (size_t) g.n_head_kv * (size_t) sp.ctx * (size_t) g.head_dim * 2;       // k16 / v16
     fixed += (size_t) g.n_head * 8 * n_chunk * ((size_t) g.head_dim * 4 + 8);            // pacc, pm, pl
@@ -1272,24 +1277,26 @@ template <class T> T* dalloc_t(size_t n) {
 }
 using strata::core::OnDevice;
 
-/// The per-row device bytes Stage::init allocates for a chunk of T rows (the auto layer split prices a card's
-/// buffers with it before anything is uploaded; kept beside init so the two agree).
-size_t stage_row_bytes(const strata::core::ModelGeometry& g, int64_t top_k, bool use_mmq) {
+/// The device bytes Stage::init allocates for a chunk of T rows (the auto layer split prices a card's buffers with
+/// it before anything is uploaded; kept beside init so the two agree: the tile-padded MMQ and scratch buffers are
+/// sized once per batch, as init sizes them).
+size_t stage_batch_bytes(const strata::core::ModelGeometry& g, int64_t top_k, bool use_mmq, size_t T) {
     const size_t N = (size_t) g.n_embd, Kp = (size_t) top_k, FF = (size_t) g.n_ff, C = (size_t) g.ssm_conv_channels;
     const size_t HD = (size_t) g.head_dim, H = (size_t) g.n_head, HKV = (size_t) g.n_head_kv;
     size_t b = 0;
-    b += 4 * N * 4 + N * 4;                                           // x, h, y, hmain; moe_out
-    b += 2 * C * 4 + 2 * (size_t) g.ssm_value_dim * 4;                // qkv, hc, z, gdn_y
-    b += 2 * (size_t) g.ssm_v_heads * 4;                              // alpha, beta
-    b += 2 * H * HD * 4 + 2 * HKV * HD * 4 + 3 * H * HD * 4;          // qg, kx, vx, q, gate, att
-    b += (size_t) (g.n_expert + 1) * 4 + Kp * N * 4 + N * 4;          // logits_r, eparts, sy
-    b += 3 * (size_t) g.n_ff_shexp * 4 + 4 + Kp * 4;                  // sg, su, shh, sgate, ewts
+    b += T * (4 * N * 4 + N * 4);                                           // x, h, y, hmain; moe_out
+    b += T * (2 * C * 4 + 2 * (size_t) g.ssm_value_dim * 4);                // qkv, hc, z, gdn_y
+    b += T * 2 * (size_t) g.ssm_v_heads * 4;                                // alpha, beta
+    b += T * (2 * H * HD * 4 + 2 * HKV * HD * 4 + 3 * H * HD * 4);          // qg, kx, vx, q, gate, att
+    b += T * ((size_t) (g.n_expert + 1) * 4 + Kp * N * 4 + N * 4);          // logits_r, eparts, sy
+    b += T * (3 * (size_t) g.n_ff_shexp * 4 + 4 + Kp * 4);                  // sg, su, shh, sgate, ewts
     const int max_in = (int) std::max<int64_t>({2 * g.n_embd, g.ssm_value_dim, g.n_head * g.head_dim, g.n_ff_shexp});
-    b += K::native_q8_1_bytes(max_in, 1) + K::native_q8_1_bytes((int) N, 1) + (size_t) max_in * 2;   // q8, xq, x16
-    b += 16 * (size_t) (g.n_expert + 1) * 4 + H * HD * 2;             // sk_part, q16
-    if (use_mmq) b += Kp * (MMQ::q8_bytes(1, g.n_embd) + MMQ::q8_bytes(1, g.n_ff) + 2 * FF * 4 + FF * 4) + Kp * 8;
-    b += K::native_expert_scratch_bytes((int64_t) Kp, (int64_t) FF) + Kp * 4 * 3 + 4;   // escr, ids, ent_*, tok
-    b += 3 * N * 4;                                                   // mtp_cat, hmtp (the last stage)
+    b += (K::native_q8_1_bytes(max_in, 1) + K::native_q8_1_bytes((int) N, 1) + (size_t) max_in * 2) * T;   // q8, xq, x16
+    b += T * (16 * (size_t) (g.n_expert + 1) * 4 + H * HD * 2);             // sk_part, q16
+    const int64_t ne = (int64_t) (T * Kp);
+    if (use_mmq) b += MMQ::q8_bytes(ne, g.n_embd) + MMQ::q8_bytes(ne, g.n_ff) + (size_t) ne * (2 * FF * 4 + FF * 4) + (size_t) ne * 8;
+    b += K::native_expert_scratch_bytes(ne, (int64_t) FF) + (size_t) ne * 4 * 3 + T * 4;   // escr, ids, ent_*, tok
+    b += T * 3 * N * 4;                                                     // mtp_cat, hmtp (the last stage)
     return b;
 }
 
@@ -1579,6 +1586,7 @@ struct Stage {
             CK(cudaMemcpy(iota_d, io.data(), T * 4, cudaMemcpyHostToDevice));
         }
         if (!first) CK(cudaHostAlloc((void**) &hand_in, T * N * 4, cudaHostAllocPortable));
+#if STRATA_Q36_DEVICE_TOPK
         if (last) {   // the sampled-request sort (see topk)
             const size_t V = (size_t) g.n_vocab;
             sort_v = dalloc(V);
@@ -1593,6 +1601,7 @@ struct Stage {
             CK(cudaHostAlloc((void**) &h_topv, kTopMax * sizeof(float), cudaHostAllocPortable));
             CK(cudaHostAlloc((void**) &h_topi, kTopMax * sizeof(int32_t), cudaHostAllocPortable));
         }
+#endif
         CK(cudaDeviceSynchronize());   // every legacy-stream cudaMemset of the buffers above is done
         size_t fr = 0, tot = 0;
         CK(cudaMemGetInfo(&fr, &tot));
@@ -1626,12 +1635,17 @@ struct Stage {
 
     /// The k largest of the logits row `lg` and their ids into h_topv / h_topi (synced).
     void topk(const float* lg, int k) {
+#if STRATA_Q36_DEVICE_TOPK
         size_t tmp = sort_tmp_bytes;
         CK(cub::DeviceRadixSort::SortPairsDescending(sort_tmp, tmp, lg, sort_v, (const int32_t*) iota_v, sort_i,
                                                      (int) m->g.n_vocab, 0, 32, st));
         CK(cudaMemcpyAsync(h_topv, sort_v, (size_t) k * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaMemcpyAsync(h_topi, sort_i, (size_t) k * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+#else
+        (void) lg;
+        (void) k;
+#endif
     }
 
     /// logits [n][V] = W_out hn rows, and each row's greedy pick (the last stage).
@@ -2219,7 +2233,7 @@ struct Engine {
     /// verify window (the GDN state left for commit()).
     void forward(int T, int64_t p0, int heads, bool graph_mode, bool verify) {
         const int N = (int) m->g.n_embd;
-        if (!graph_mode && hybrid_graph && m->hybrid && (T == 1 || verify) && T <= kVerify) {
+        if (!graph_mode && hybrid_graph && m->hybrid && (T == 1 || verify) && T <= kVerify && T <= hybrid_t) {
             forward_graphs(T, p0, heads, verify);
             return;
         }
@@ -2532,6 +2546,7 @@ struct Engine {
                 CK(cudaMemcpyAsync(seeds, L.hmain, fix.size() * (size_t) N * 4, cudaMemcpyDeviceToDevice, L.st));
             CK(cudaMemcpyAsync(seeds + fix.size() * (size_t) N, L.hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, L.st));
             forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0, false);
+            if (D == 0) CK(cudaStreamSynchronize(L.st));   // (its uploads done before the window's staging is rewritten)
             if (D > 0) {
                 CK(cudaMemcpyAsync(L.hpin + 2, L.pick_m, 4, cudaMemcpyDeviceToHost, L.st));
                 CK(cudaStreamSynchronize(L.st));
@@ -2658,6 +2673,7 @@ struct Engine {
                 CK(cudaMemcpyAsync(seeds, L.hmain, fix.size() * (size_t) N * 4, cudaMemcpyDeviceToDevice, L.st));
             CK(cudaMemcpyAsync(seeds + fix.size() * (size_t) N, L.hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, L.st));
             forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0, false);
+            if (D == 0) CK(cudaStreamSynchronize(L.st));   // (its uploads done before the window's staging is rewritten)
             if (D > 0) {
                 CK(cudaMemcpyAsync(L.hpin + 2, L.pick_m, 4, cudaMemcpyDeviceToHost, L.st));
                 CK(cudaStreamSynchronize(L.st));
@@ -2935,9 +2951,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         if (!P.hybrid) continue;
         Stage& s = *E.stg[i];
         OnDevice od(s.dev);
-        s.main_hybrid = E.main_hybrid;
+        s.main_hybrid = P.hybrid && !P.mtp_only;   // this stage's own main layers (streamed prompt chunks, the batch size)
         s.hybrid_t = E.hybrid_t;
-        s.hyT = E.main_hybrid ? E.hybrid_t : E.tmax;   // every batch is a hybrid batch when only the MTP block is
+        s.hyT = s.main_hybrid ? std::max(E.hybrid_t, Stage::kVerify) : E.tmax;   // every batch is a hybrid batch when only the MTP block is
         const size_t staging = s.use_mmq && E.main_hybrid && !P.mtp_only ? 2 * (P.max_layer + kMmqTail) : 0;
         size_t slot_bytes = P.budget > staging ? P.budget - staging : 0;
         if (slot_bytes + staging + ((size_t) 256 << 20) > P.fr)
@@ -3080,7 +3096,7 @@ int sample_next(Engine& E, const Sampling& s, const std::vector<int32_t>& hist, 
                 std::vector<float>& lg, std::vector<float>& tv, std::vector<int32_t>& ti) {
     const bool penal = s.last_n != 0 && (s.repeat != 1.f || s.freq != 0.f || s.present != 0.f);
     const int kk = std::max(1, s.top_k > 0 ? s.top_k : 64);
-    if (!penal && s.temperature > 0.f && kk <= Stage::kTopMax) {
+    if (STRATA_Q36_DEVICE_TOPK && !penal && s.temperature > 0.f && kk <= Stage::kTopMax) {
         E.host_topk(kk, tv, ti);
         return sample_from(tv.data(), ti.data(), (int) tv.size(), s, rng);
     }
@@ -3238,7 +3254,7 @@ int serve(Engine& E) {
         // sampled ones too (no penalties, a top-k the device sort covers): the drafts verified against the sampled
         // distribution, so the text is a draw from the same sampler
         const bool penal = smp.last_n != 0 && (smp.repeat != 1.f || smp.freq != 0.f || smp.present != 0.f);
-        const bool spec_s = E.mtp_d > 0 && smp.needs_logits() && !penal && smp.temperature > 0.f &&
+        const bool spec_s = STRATA_Q36_DEVICE_TOPK && E.mtp_d > 0 && smp.needs_logits() && !penal && smp.temperature > 0.f &&
                             std::max(1, smp.top_k > 0 ? smp.top_k : 64) <= Stage::kTopMax &&
                             std::getenv("STRATA_Q36_NO_SPEC_SAMPLING") == nullptr;
         std::vector<int32_t> fix, drafts;
@@ -3262,14 +3278,13 @@ int serve(Engine& E) {
             if ((spec || spec_s) && E.pos + E.mtp_d + 1 <= E.ctx) {
                 const int a = spec ? E.spec_step(nx, fix, E.mtp_d, drafts, picks)
                                    : E.spec_step_sampled(nx, fix, E.mtp_d, drafts, picks, smp, rng, tv, ti);
-                offered += E.mtp_d;
+                offered += (long long) drafts.size();   // (clamped at a rebalance boundary)
                 accepted += a;
                 live.push_back(nx);
                 fix.assign(drafts.begin(), drafts.begin() + a);
-                for (int i = 0; i < a; ++i) {
-                    live.push_back(drafts[(size_t) i]);
+                live.insert(live.end(), drafts.begin(), drafts.begin() + a);   // (the engine holds them all, ended or not)
+                for (int i = 0; i < a; ++i)
                     if (!emit(drafts[(size_t) i])) { done = true; break; }
-                }
                 nx = picks[a];
                 have_next = true;
                 continue;
@@ -3415,7 +3430,8 @@ int strata::qwen35::run(int argc, char** argv) {
             if (m.dev_of[l] == m.dev_of[0]) experts += m.layers[l].stride * (size_t) m.g.n_expert;
         // (the MTP block's experts can go to the CPU, the packed Q8_0 copies can be given back: see place_experts)
         size_t packed = 0;
-        for (const auto& pk : m.packed) packed += std::get<2>(pk);
+        if (m.last_dev == m.dev_of[0])   // (two cards never give them back: place_experts)
+            for (const auto& pk : m.packed) packed += std::get<2>(pk);
         fr += packed;
         // the engine's buffers at 512 (~1.1 GiB on gfx1201 at 8K, less the scores buffer's shrink) + the small reserve
         const double want = (double) experts + 1.1 * (1ull << 30);
