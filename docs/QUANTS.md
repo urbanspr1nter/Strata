@@ -34,9 +34,9 @@ SHA-256), so a PC that has one of them can link those two shards instead of down
 
 | Format (role) | CUDA decode (grouped experts) | CUDA prompt | CPU pool | AMD (HIP) decode | AMD prompt | Intel (SYCL) decode | Intel prompt |
 |---|---|---|---|---|---|---|---|
-| Q4_K (gate/up) | yes | FP16 path; MMQ with `STRATA_MMQ_KQ=1` | ggml AVX2 dot; multi-token AVX2 (`STRATA_KQ256=1`) | yes (CUDA layout; `STRATA_EXPERT_V2K=1` bitwise) | FP16 path; MMQ with `STRATA_MMQ_KQ=1`; gfx11 fused (`STRATA_PF_FUSED_KQ=1`) | kernels built, not run with these files | FP16 path |
-| Q5_K (gate/up) | yes | as Q4_K | ggml AVX2 dot | as Q4_K | as Q4_K | kernels built, not run with these files | FP16 path |
-| Q6_K (gate/up) | yes (since this change; was `-DSTRATA_Q6K_EXPERTS=ON`) | FP16 path; MMQ with `STRATA_MMQ_KQ=1` | ggml AVX2 dot | yes (CUDA layout) | FP16 path; MMQ with `STRATA_MMQ_KQ=1` | kernels built, not run with these files | FP16 path |
+| Q4_K (gate/up) | yes | FP16 path; MMQ with `STRATA_MMQ_KQ=1` | ggml AVX2 dot; multi-token AVX2 (`STRATA_KQ256=1`); AVX-VNNI multi-row (`STRATA_KQ_VNNI=1`, bit-exact) | yes (CUDA layout; `STRATA_EXPERT_V2K=1` bitwise) | FP16 path; MMQ with `STRATA_MMQ_KQ=1`; gfx11 fused (`STRATA_PF_FUSED_KQ=1`) | kernels built, not run with these files | FP16 path |
+| Q5_K (gate/up) | yes | as Q4_K | ggml AVX2 dot; AVX-VNNI multi-row (`STRATA_KQ_VNNI=1`, bit-exact) | as Q4_K | as Q4_K | kernels built, not run with these files | FP16 path |
+| Q6_K (gate/up) | yes (since this change; was `-DSTRATA_Q6K_EXPERTS=ON`) | FP16 path; MMQ with `STRATA_MMQ_KQ=1` | ggml AVX2 dot; AVX-VNNI multi-row (`STRATA_KQ_VNNI=1`, bit-exact) | yes (CUDA layout) | FP16 path; MMQ with `STRATA_MMQ_KQ=1` | kernels built, not run with these files | FP16 path |
 | Q5_1 (down) | yes | as Q4_K | ggml AVX2 dot; multi-token AVX2 (`STRATA_KQ256=1`) | yes (CUDA layout; V2K) | as Q4_K | kernels built, not run with these files | FP16 path |
 | Q8_0 (gate/up, down) | yes | MMQ | ggml AVX2 dot; multi-token AVX2 down (`STRATA_KQ256=1`) | yes (CUDA layout; V2K down) | MMQ | kernels built, not run with these files | FP16 path |
 

@@ -7,6 +7,7 @@
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx1.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
+#include "strata/kernels/cpu/kq_vnni.hpp"
 #include "strata/kernels/cpu/nvfp4_avx2.hpp"
 #include "strata/kernels/cpu/nvfp4_avx512.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -46,6 +47,8 @@ bool iq256_supported(int type) noexcept {
 }
 
 bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type == 8; }
+
+bool kq_vnni_supported(int type) noexcept { return type == 12 || type == 13 || type == 14; }   // Q4_K, Q5_K, Q6_K
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
     init_once();
@@ -107,6 +110,22 @@ bool q8k_avx1(int type) {
     static const bool on = !cpu_avx2_ok() && cpu_avx1_ok() && std::getenv("STRATA_NO_Q8K_AVX1") == nullptr;
     return on && type == (int) GGML_TYPE_Q8_K;
 }
+// Qwen3.6-35B-A3B UD-Q4_K_XL's K-quant rows (Q4_K gate/up, Q5_K / Q6_K down) on AVX-VNNI, up to 8 tokens per pass
+// over the weights (kq_vnni.cpp): bit-exact against ggml's dot below at any group size (kq_vnni_parity).  Opt-in,
+// STRATA_KQ_VNNI=1, and only where cpu_avxvnni_ok() (Alder Lake and later): the default path stays ggml's.  From
+// two tokens on: at one token the kernels are ggml's speed on a P-core and slower on an E-core (i5-13400,
+// kq_cpu_bench, a 2048 x 512 q4_K/q6_K expert from DRAM: 0.108 -> 0.109 ms and 0.253 -> 0.296 ms), and from two on
+// they are faster on both (P-core 0.189 -> 0.136 ms at two, 0.333 -> 0.177 at four; E-core 0.467 -> 0.404 and
+// 0.911 -> 0.694), the pool with 10 threads 60 -> 69 GB/s of weights at two tokens and 41 -> 68 at four (of the
+// DRAM's 81; 72 at one token either way).  AGENTS_FORK.md has the whole table.
+bool kq_vnni_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_KQ_VNNI");
+        return v != nullptr && std::atoi(v) != 0 && cpu_avxvnni_ok();
+    }();
+    return on;
+}
+constexpr int kKqVnniMinT = 2;   // one token: ggml's own dot (the same bits)
 }  // namespace
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
@@ -165,6 +184,12 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // independent of the drafting: iq_avx1_parity checks every width bit for bit).
     static const bool avx1 = !cpu_avx2_ok() && cpu_avx1_ok() && std::getenv("STRATA_NO_IQ128") == nullptr;
     const int mt_min = native_gu_mt_min(f.gu_type);   // #152
+    // the AVX-VNNI K-quant rows (kq_vnni_on above) before every other path for these types; they carry no NVFP4
+    // tail scales (a mixed blob's would be 1.0, but the path is taken only without a tail)
+    if (nt >= kKqVnniMinT && f.tail_off == 0 && kq_vnni_supported(f.gu_type) && kq_vnni_on()) {
+        kq_vnni_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        return;
+    }
     // Unsloth UD-Q4_K_XL's Q4_K gate/up: the multi-token kernel is bit-exact against ggml's per-token dot (any group
     // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
     // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
@@ -240,6 +265,10 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     // Both multi-token kernels below are /arch:AVX2 translation units (kq_avx2.cpp and iq_avx2.cpp),
     // so a CPU without AVX2 has to reach ggml-cpu's vec_dot instead - same reasoning as the gate/up
     // rows above, where `avx512` tested cpu_avx512_ok() and `avx2` did not.
+    if (nt >= kKqVnniMinT && f.tail_off == 0 && kq_vnni_supported(f.d_type) && kq_vnni_on()) {   // Q5_K / Q6_K down: see native_gu_rows
+        kq_vnni_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     if (cpu_avx2_ok() && kq && nt >= 2 && (f.d_type == 7 || f.d_type == 8)) {   // Q5_1 / Q8_0 down: bit-exact, any group size
         kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
