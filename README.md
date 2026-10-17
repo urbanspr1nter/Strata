@@ -13,15 +13,27 @@ Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Nex
 large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
 and coding agents. Nothing leaves your PC.
 
-## This is a fork: Strata for two RTX 2080s and an Intel CPU
+## This is a fork: Strata for two 8 GB RTX 2080s, an Intel CPU with AVX2 and 32 GB of RAM
 
-This repository is a fork of [Strata](https://github.com/Niko1221/Strata), tailored to one kind of PC: **two 8 GB
-graphics cards and an Intel desktop CPU**. It was built and measured on two RTX 2080s (one on PCIe 3.0 x16, one on
-x4, no peer-to-peer), an i5-13400 (6 P + 4 E cores) and 32 GB of DDR5-6000 under Linux, and it runs
-**[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)** (Unsloth's UD-Q4_K_XL GGUF) across both
-cards at up to 262K context. The stock engine does not start on an 8 GB card at all. What changed and every
-measurement: [docs/QWEN36.md](docs/QWEN36.md); the project log: [AGENTS_FORK.md](AGENTS_FORK.md). Everything from
-"How fast is it?" on is upstream's README, about upstream's model.
+**Minimum:** an x86-64 CPU with AVX2, one NVIDIA card with 8 GB of VRAM (RTX 20 series or newer; two cards are
+what this fork is built and measured for), 32 GB of RAM, 23 GB of disk for the model, Linux (Windows not built
+here). **For best results, use the RAM with the highest memory bandwidth you can get** - dual-channel DDR5-6000
+here, 81 GB/s measured - because during decode the CPU side streams the experts that are not in VRAM from RAM,
+54-75% of every step. A CPU with AVX-VNNI (Intel 12th gen and later) takes 14% off that CPU time.
+
+| | |
+| --- | --- |
+| **CPU** | x86-64 with AVX2 (any desktop CPU from the last ~8 years). AVX-VNNI (Intel 12th gen "Alder Lake" and later) for the faster expert rows, [below](#which-cpu). Measured on an i5-13400 (6 P + 4 E cores). |
+| **Graphics cards** | Two NVIDIA cards with 8 GB each, measured on two RTX 2080s (one on PCIe 3.0 x16, one on x4, no peer-to-peer). One 8 GB card runs it too (engine bench at 128K context, no drafts: 57-75 tokens/s against 63-75 with two cards, which also read prompts faster and hold more experts). The stock engine does not start on an 8 GB card at all. |
+| **RAM** | 32 GB. The experts that do not fit in VRAM live in pinned RAM (15.4 GiB on this PC, 9 GiB to spare). **The faster, the better:** DDR5-6000 here. |
+| **Disk** | 23 GB for the model file (the Unsloth UD-Q4_K_XL GGUF). An SSD for the first start. |
+| **System** | Linux (kernel 7.0, CUDA 13.4 here). Windows was not built or tested in this fork. |
+
+This repository is a fork of [Strata](https://github.com/Niko1221/Strata), tailored to that kind of PC, and it runs
+**[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)** (Unsloth's UD-Q4_K_XL GGUF) across
+both cards at up to 262K context. What changed and every measurement: [docs/QWEN36.md](docs/QWEN36.md); the project
+log: [AGENTS_FORK.md](AGENTS_FORK.md). Everything from "How fast is it?" on is upstream's README, about upstream's
+model.
 
 Measured through the server on that PC (2026-10-16, the 128K-context config, greedy, medians of 3 runs):
 
@@ -37,16 +49,16 @@ The same requests to llama.cpp (b11559, the same GGUF, the experts of 32 layers 
 engines (12 of 12 each); at the 262K config this fork finds it in 160K, 200K and 250K-token prompts too (9 of 9;
 llama.cpp not measured there).
 
-**Which CPU.** Any x86-64 CPU with AVX2 runs it, as with upstream; the generation matters in one place. On a CPU
-with **AVX-VNNI** (Intel 12th gen "Alder Lake" and later have it; on an AMD CPU check the flag - Zen 4 has only
-the AVX-512 form, which these kernels do not use), the CPU side's expert rows go through this fork's VNNI
-kernels, which took 14% off the CPU pool's time on the i5-13400 (drafted decode at 128K on the engine bench,
-three runs, 87-107 to 97-107 tok/s). Any other CPU keeps ggml's rows and gives the same output bits. On Linux,
-`grep -c avx_vnni /proc/cpuinfo` says whether yours has it (0 means no). The P/E-core layout is
-handled (`--pool-affinity`; the E-cores stay in the pool, measured faster than the P-cores alone). What matters
-more than the generation is memory bandwidth: during decode the CPU pool streams the experts that are not in VRAM
-from RAM and takes 54-75% of a step (the share grows with the context, which takes the VRAM slots), so a DDR4 PC
-would decode slower in that share. Measured on this one PC only.
+<a id="which-cpu"></a>**Which CPU.** Any x86-64 CPU with AVX2 runs it, as with upstream; the generation matters in
+one place. On a CPU with **AVX-VNNI** (Intel 12th gen "Alder Lake" and later have it; on an AMD CPU check the
+flag - Zen 4 has only the AVX-512 form, which these kernels do not use), the CPU side's expert rows go through
+this fork's VNNI kernels, which took 14% off the CPU pool's time on the i5-13400 (drafted decode at 128K on the
+engine bench, three runs, 87-107 to 97-107 tok/s). Any other CPU keeps ggml's rows and gives the same output
+bits. On Linux, `grep -c avx_vnni /proc/cpuinfo` says whether yours has it (0 means no). The P/E-core layout is
+handled (`--pool-affinity`; the E-cores stay in the pool, measured faster than the P-cores alone). Memory
+bandwidth matters more than the generation: the CPU pool streams the missed experts from RAM and takes 54-75% of
+a decode step (the share grows with the context, which takes the VRAM slots), so a DDR4 PC would decode slower in
+that share. Measured on this one PC only.
 
 ## How fast is it?
 
