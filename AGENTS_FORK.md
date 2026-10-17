@@ -553,6 +553,12 @@ finding as the earlier 3-draft measurement). llama-server's own setting is `--sp
 Both servers were down in turn for these runs (the GPUs hold one model at a time); the fork's server came back
 on 0.0.0.0:8080 with its key afterwards.
 
+**The same depth test at the 262K configuration** (`./setup.sh ... --context 262144`, the user's server since
+then: the first card's layers 0-34 with no base slot and 30 elastic slots, the second card's layers 35-39 with
+every expert): 160K, 200K and 250K-token prompts (158,206 / 200,217 / 252,286 tokens), the code word at 10 / 50 /
+90% - 9 of 9 found; the prompts read in 257-259 s, 379-380 s and 565-566 s (610 / 527 / 446 tok/s: the prompt
+attention's share grows with the prefix).
+
 ## Future improvements (not done; each with the measurement that motivates it)
 
 - **Prompt attention at long prefixes.** A 40,000-token prompt reads at 700-735 tok/s against ~1,300 for a short

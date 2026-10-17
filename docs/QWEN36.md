@@ -109,7 +109,7 @@ Teacher-forced next-token distributions on four sequences (memorized prose, code
 llama-server placement) is the distance between llama.cpp's own GPU and CPU runs - KL mean 0.0028-0.044 against
 the floor's 0.0027-0.041, top-1 agreement 96.0-98.1% against 95.8-97.5%, perplexities equal to the third digit
 (code 4.322 / 4.314, document 6.621 / 6.587). Needle in a haystack (`tools/needle_bench.py`) at 8K, 32K, 64K and
-120K tokens, depths 10 / 50 / 90%: 12 of 12 found by both engines, the 120K prompt read in 159 s here against 415 s there. GSM8K, the first 40 test problems with thinking on
+120K tokens, depths 10 / 50 / 90%: 12 of 12 found by both engines, the 120K prompt read in 159 s here against 415 s there; at the 262K configuration 160K, 200K and 250K-token prompts at the same depths, 9 of 9 found (the 250K prompt read in about 9.5 minutes). GSM8K, the first 40 test problems with thinking on
 (`tools/gsm8k_eval.py`, Qwen's sampling, 6,144-token limit): 37 of 40 against llama-server's 35 of 40, median
 1,335 against 1,425 completion tokens, 94.7 against 60.4 tok/s. AGENTS_FORK.md has the tables.
 
