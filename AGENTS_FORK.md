@@ -486,6 +486,73 @@ Through the server after the restart (the user's config: 128K context, 8-bit KV,
 the 32K config 79.9); a 4K prompt 1,170 tok/s, a 16K prompt 1,202 (1,216 / 1,207 on the 32K config before); the
 agent session 68% reused, its turns' first token 1.8-4.4 s and decode 87.4 tok/s (75.9-94.5; 83.0 before).
 
+## 2026-10-16 - accuracy against llama.cpp on the same GGUF (teacher-forced KL, needle depth, GSM8K), and MTP 3
+
+Three tests of the fork's engine against llama.cpp b11559 with the user's own llama-server settings
+(`--spec-type draft-mtp --spec-draft-n-max 3 -ngl 999 -fa on -ctk q8_0 -ctv q8_0 --n-cpu-moe 32 -ts 3,1 -c 262144
+-t 10`), the same UD-Q4_K_XL file, the same PC, the same day. The fork ran as the user runs it: two cards,
+`--layer-split auto`, 128K context, `--kv q8_0`, `--mtp 2`, through the server with its API key.
+
+**Teacher-forced next-token distributions** (`tools/qwen35/tf_compare.py` with `tools/qwen35/q36_llama_dump.cpp`,
+which now takes `--n-cpu-moe`, `--tensor-split`, `--threads`, `--kv q8_0`, `--batch`/`--ubatch` so that the
+reference is llama.cpp placed as llama-server places it). Four token sequences: the first 837 tokens of *Alice in
+Wonderland* (prose the model has memorized: perplexity 1.5), 965 tokens of `serve/server.py` (code), 1,508 tokens
+of docs/DETAILS.md (a technical document), and a chat (the lighthouse-keeper prompt rendered with the template,
+thinking off, plus llama.cpp's own 160-token greedy answer). The first 100 tokens are the prompt, the rest are fed
+one at a time and every step's full logits (248,320 floats) are kept; the metric is KL(reference || engine) per
+step, the top-1 agreement, and each engine's perplexity and next-token accuracy on the forced tokens. The
+reference is llama.cpp on the GPUs; llama.cpp on the CPU alone (`--ngl 0`, f16 K/V) is the noise floor: two
+backends of the same program.
+
+| sequence (steps) | llama.cpp GPU -> Strata: KL mean / median / p99 / max, top-1 agree | llama.cpp GPU -> llama.cpp CPU (the floor) | perplexity GPU / CPU / Strata |
+| --- | --- | --- | --- |
+| prose, 737 | 0.044 / 0.0003 / 0.85 / 2.7, 96.7% | 0.041 / 0.0003 / 0.72 / 5.8, 96.1% | 1.514 / 1.474 / 1.481 |
+| code, 865 | 0.0028 / 0.0012 / 0.023 / 0.10, 96.8% | 0.0027 / 0.0011 / 0.019 / 0.07, 97.3% | 4.314 / 4.320 / 4.322 |
+| document, 1,408 | 0.0043 / 0.0011 / 0.033 / 0.91, 96.0% | 0.0040 / 0.0011 / 0.041 / 0.13, 95.8% | 6.587 / 6.612 / 6.621 |
+| chat, 160 | 0.0054 / 0.0015 / 0.057 / 0.07, 98.1% | 0.0056 / 0.0013 / 0.058 / 0.14, 97.5% | 1.398 / 1.404 / 1.399 |
+
+Strata is at the floor on every sequence: its distance from llama.cpp's GPU run is the distance between
+llama.cpp's own GPU and CPU runs, in the mean, the tail and the top-1 agreement, and the perplexities match to
+the third digit. The prose sequence has a few steps where any two runs disagree hard (the memorized text makes
+the model 96% sure of one token, and a small numeric difference in the recurrent state flips it: "after such a"
+-> " fall" against " ch", "like a" -> " tunnel" against " long"); the floor has the same outliers (max 5.8).
+Eight variants of the engine's path on that sequence - fp32 K/V, upstream's attention kernel, both, no elastic
+region, the eager decode, nearly every expert on the CPU pool (`--expert-slots 1`), one card, the prompt as a
+hybrid batch - all land in the same band (KL mean 0.037-0.058, top-1 95.8-96.7%): none of the fork's paths moves
+the distribution, and the eager and graph paths are bit-identical.
+
+**Needle in a haystack by depth** (`tools/needle_bench.py`: the repository's own text as filler, a code word at
+10 / 50 / 90% of the text, thinking off, greedy): 8K, 32K, 64K and 120K-token prompts.
+
+| prompt | Strata (two cards, 128K, 8-bit K/V) | llama-server (262K, q8_0 K/V) |
+| --- | --- | --- |
+| 8K, depths 10 / 50 / 90% | found / found / found (7 / 7 / 5 s) | found / found / found (20 / 20 / 20 s) |
+| 32K | found / found / found (27 / 28 / 28 s) | found / found / found (101 / 101 / 101 s) |
+| 64K | found / found / found (67 / 67 / 67 s) | found / found / found (211 / 211 / 211 s) |
+| 120K (117,427 tokens) | found / found / found (159 / 159 / 159 s) | found / found / found (415 / 416 / 415 s) |
+
+**GSM8K, thinking on** (`tools/gsm8k_eval.py`: the first 40 test problems, temperature 0.6 / top-p 0.95 / top-k
+20 as Qwen recommends for thinking, one seed per problem, at most 6,144 tokens, the answer the last `\boxed{}`):
+
+| | correct | hit the 6,144-token limit | completion tokens, mean / median | reasoning, mean chars | decode (the server's own) | 40 problems |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Strata | 37 of 40 (92.5%) | 4 | 2,332 / 1,335 | 6,410 | 94.7 tok/s | 16.9 min |
+| llama-server | 35 of 40 (87.5%) | 3 | 2,107 / 1,425 | 5,772 | 60.4 tok/s | 24.8 min |
+
+Two problems apart on 40 is noise (they disagree on four: each engine lost one to the token limit, and each
+lost one with a finished answer). On the length of the thinking: the medians are 1,335 against 1,425 tokens and
+Strata was shorter on 17 of the 40, so "it thinks less" is not systematic - sampled runs vary problem by problem,
+and the mean is pulled up by whichever run hit the limit more often.
+
+**MTP 3 against 2** (the same build, the engine bench at 128K and a 512-token greedy generation from a 29-token
+prompt, back to back): with 2 drafts the bench's drafted tg64 is 101 / 106 / 87 tok/s and the generation runs at
+86.4 tok/s (78% of the drafts accepted); with 3 drafts 79 / 86 / 73 and 81.5 tok/s (66% accepted). `--mtp 3` is
+an option, but on this PC the third draft row costs the CPU pool more than its acceptances return (the same
+finding as the earlier 3-draft measurement). llama-server's own setting is `--spec-draft-n-max 3`.
+
+Both servers were down in turn for these runs (the GPUs hold one model at a time); the fork's server came back
+on 0.0.0.0:8080 with its key afterwards.
+
 ## Future improvements (not done; each with the measurement that motivates it)
 
 - **Prompt attention at long prefixes.** A 40,000-token prompt reads at 700-735 tok/s against ~1,300 for a short

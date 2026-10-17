@@ -8,12 +8,17 @@
 //       -lggml-base -Wl,-rpath,<llama>/build/bin -o q36_llama_dump
 // Usage: q36_llama_dump --model GGUF (--prompt TEXT | --tokens ID,ID,...) [--n 64] [--ngl 99] [--dump-layers F]
 //                       [--dump-logits F] [--force ID,ID,...] [--dump-full-logits F]
+//                       [--n-cpu-moe N] [--tensor-split A,B] [--threads T] [--kv q8_0] [--ctx N] [--batch N] [--ubatch N]
+//   --n-cpu-moe N keeps the routed experts of the first N layers in host memory (llama-server's --n-cpu-moe),
+//   --tensor-split the cards' shares (-ts), --kv q8_0 the 8-bit K/V cache with flash attention (-ctk/-ctv q8_0 -fa on):
+//   the same placement as a llama-server run on small cards.
 //   --force feeds that continuation instead of the greedy ids (teacher forcing); --dump-full-logits writes every
 //   step's logits (f32, [step][vocab]).
 //   --prompt is tokenized with special tokens parsed and no BOS added (Qwen adds none).
 #include "llama.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -54,8 +59,8 @@ std::vector<int> parse_ids(const std::string& s) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model, prompt, tokens, dump_layers, dump_logits, force, dump_full;
-    int n_gen = 64, ngl = 99;
+    std::string model, prompt, tokens, dump_layers, dump_logits, force, dump_full, tsplit, kv;
+    int n_gen = 64, ngl = 99, n_cpu_moe = 0, threads = 0, ctx_arg = 0, n_batch = 0, n_ubatch = 0;
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
         if (a == "--model") model = v;
@@ -67,6 +72,13 @@ int main(int argc, char** argv) {
         else if (a == "--dump-logits") dump_logits = v;
         else if (a == "--force") force = v;
         else if (a == "--dump-full-logits") dump_full = v;
+        else if (a == "--n-cpu-moe") n_cpu_moe = std::atoi(v.c_str());
+        else if (a == "--tensor-split") tsplit = v;
+        else if (a == "--threads") threads = std::atoi(v.c_str());
+        else if (a == "--kv") kv = v;
+        else if (a == "--ctx") ctx_arg = std::atoi(v.c_str());
+        else if (a == "--batch") n_batch = std::atoi(v.c_str());     // llama-server's defaults are 2048 / 512: the
+        else if (a == "--ubatch") n_ubatch = std::atoi(v.c_str());   // 4096-row compute buffers need ~4 GB on a card
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
     // STRATA_DUMP_NGL: the GPU layers when the caller asks for the GPU (--ngl > 0) but the file does not fit (UD-Q4_K_XL
@@ -75,6 +87,19 @@ int main(int argc, char** argv) {
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = ngl;
+    std::vector<std::string> pats;
+    std::vector<llama_model_tensor_buft_override> ovr;
+    if (n_cpu_moe > 0) {   // as llama-server's --n-cpu-moe: those layers' routed experts on the CPU buffer type
+        for (int l = 0; l < n_cpu_moe; ++l) pats.push_back("blk\\." + std::to_string(l) + "\\.ffn_(up|down|gate)_exps");
+        for (const std::string& p : pats) ovr.push_back({p.c_str(), ggml_backend_cpu_buffer_type()});
+        ovr.push_back({nullptr, nullptr});
+        mp.tensor_buft_overrides = ovr.data();
+    }
+    std::vector<float> split;
+    if (!tsplit.empty()) {
+        for (int t : parse_ids(tsplit)) split.push_back((float) t);
+        mp.tensor_split = split.data();
+    }
     llama_model* mdl = llama_model_load_from_file(model.c_str(), mp);
     if (!mdl) { std::fprintf(stderr, "cannot load %s\n", model.c_str()); return 1; }
     const llama_vocab* vocab = llama_model_get_vocab(mdl);
@@ -94,9 +119,15 @@ int main(int argc, char** argv) {
     // STRATA_DUMP_CTX: a smaller context / batch (the parity sequences are a few hundred tokens) for a file whose
     // weights leave no VRAM for the 4096-token compute buffers (UD-Q6_K_XL on a 32 GB card)
     const char* cx = std::getenv("STRATA_DUMP_CTX");
-    const int nctx = cx ? std::atoi(cx) : 4096;
+    const int nctx = ctx_arg > 0 ? ctx_arg : cx ? std::atoi(cx) : 4096;
     cp.n_ctx = nctx;
-    cp.n_batch = cp.n_ubatch = nctx;
+    cp.n_batch = n_batch > 0 ? n_batch : std::min(nctx, 4096);
+    cp.n_ubatch = n_ubatch > 0 ? n_ubatch : cp.n_batch;
+    if (threads > 0) cp.n_threads = cp.n_threads_batch = threads;
+    if (kv == "q8_0") {
+        cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
     cp.op_offload = ngl > 0;   // --ngl 0 is the CPU backend: no prompt matmuls offloaded to a GPU either
     cp.cb_eval = on_tensor;
     cp.cb_eval_user_data = &cap;

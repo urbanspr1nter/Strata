@@ -102,6 +102,17 @@ The engine's own bench (`--bench-pp N --bench-tg 64`, 3 reps, random prompts; ll
 drafts): a 2,048-token prompt 1,084 / 1,289 / 1,298 tok/s against 414; greedy decode 62-70 tok/s against 45.0;
 with 2 drafts 68-80. After a 14,000-token prompt: 56-61 tok/s (61-64 with drafts).
 
+## Accuracy against llama.cpp (the same GGUF, the same PC, 2026-10-16)
+
+Teacher-forced next-token distributions on four sequences (memorized prose, code, a document, a chat; 160 to
+1,408 steps each; `tools/qwen35/tf_compare.py`): Strata's distance from llama.cpp's GPU run (b11559, the user's
+llama-server placement) is the distance between llama.cpp's own GPU and CPU runs - KL mean 0.0028-0.044 against
+the floor's 0.0027-0.041, top-1 agreement 96.0-98.1% against 95.8-97.5%, perplexities equal to the third digit
+(code 4.322 / 4.314, document 6.621 / 6.587). Needle in a haystack (`tools/needle_bench.py`) at 8K, 32K, 64K and
+120K tokens, depths 10 / 50 / 90%: 12 of 12 found by both engines, the 120K prompt read in 159 s here against 415 s there. GSM8K, the first 40 test problems with thinking on
+(`tools/gsm8k_eval.py`, Qwen's sampling, 6,144-token limit): 37 of 40 against llama-server's 35 of 40, median
+1,335 against 1,425 completion tokens, 94.7 against 60.4 tok/s. AGENTS_FORK.md has the tables.
+
 Where a decoded token's time goes (nsys, short context): ~6.5 ms of GPU kernels (the Q8_0 dense GEMVs near the
 card's bandwidth), ~5 ms on the CPU pool (32 us per missed expert, DRAM-bound), serialized by the layer
 dependency; ~2 ms of host overhead. Drafts amortize all of it.
