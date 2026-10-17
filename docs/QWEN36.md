@@ -83,6 +83,10 @@ Through the server (`tools/strata_bench.py`, greedy, thinking off, medians of 3 
 | 16K prompt, fresh | 1,207 tok/s | - | 13.3 s |
 | agent session, turns 2-6 (3.7K to 14.5K tokens of context) | 814-977 tok/s over the new tokens, 68% reused | 83.0 tok/s (66-93) | 1.8-3.6 s |
 
+The same suite on the 128K-context config setup writes now (8-bit KV, the elastic region, 2026-10-16 later that
+day): chat decode 84.4 tok/s (80.4-99.5), first token 0.21 s; 4K prompt 1,170 tok/s; 16K prompt 1,202 tok/s;
+agent session 68% reused, turns' first token 1.8-4.4 s, decode 87.4 tok/s (75.9-94.5).
+
 The same requests to llama.cpp (b11559) with the user's own settings (`--spec-type draft-mtp --spec-draft-n-max 3
 -ngl 999 -fa on -ctk q8_0 -ctv q8_0 --n-cpu-moe 32 -ts 3,1 -t 10`), both at temperature 1.0 / top-p 0.95 / top-k
 20, the servers' own timings:

@@ -480,6 +480,12 @@ The stats line at exit (stderr) now also says: the switches and their time, the 
 prompt the extra slots were all in use, and the slot replacements right after batches (`STRATA_Q36_SWAP_DEBUG=1`
 prints them per batch).
 
+Through the server after the restart (the user's config: 128K context, 8-bit KV, `--mtp 2`, both cards, host
+0.0.0.0 with an API key; `tools/strata_bench.py --url ... --runs 3`, greedy, thinking off, medians): chat decode
+84.4 tok/s (80.4-99.5) and the first token in 0.21 s (the 128K config measured 62-80 tok/s before elastic, and
+the 32K config 79.9); a 4K prompt 1,170 tok/s, a 16K prompt 1,202 (1,216 / 1,207 on the 32K config before); the
+agent session 68% reused, its turns' first token 1.8-4.4 s and decode 87.4 tok/s (75.9-94.5; 83.0 before).
+
 ## Future improvements (not done; each with the measurement that motivates it)
 
 - **Prompt attention at long prefixes.** A 40,000-token prompt reads at 700-735 tok/s against ~1,300 for a short
