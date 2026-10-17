@@ -381,6 +381,105 @@ A two-row job on the pool therefore costs 1.05x a one-row job instead of 1.3x, a
 1.8-2.2x: the verify windows and hybrid batches (2-8 rows) no longer pay linearly. Not yet measured: the engine end
 to end with `STRATA_KQ_VNNI=1` (the GPUs were busy with another benchmark).
 
+## 2026-10-16 - elastic VRAM: the prompt chunk's buffers become expert slots between prompts
+
+On an 8 GB card the streamed prompt path owns ~2.1 GiB that decode never touches: the chunk's row buffers (2,048
+rows of activations, routing tables and MMQ scratch, ~1.2 GiB) and the two staging buffers (two whole layers of
+experts, 0.9 GiB). Decode needs buffers for at most `hybrid_t` (32) rows. Now a hybrid stage with the streamed
+path keeps a second, small row set, and the big set plus the staging buffers exist only while a prompt longer
+than `hybrid_t` tokens runs (`enter_prompt_phase` / `enter_decode_phase` around the chunk loop in `process()`).
+Between prompts their VRAM holds extra expert slots in a second slot region (`Layer::blobs2`, slots `n_slots1 ..`),
+filled by routing score after each streamed prompt; `k_group_hy` and the streaming copies address a slot through
+`slot_ptr`. Off with `STRATA_Q36_NO_ELASTIC=1`, `--expert-slots` or `--expert-vram` (the slots as placed, always).
+
+The first version freed and re-allocated the 2.1 GiB at every switch and filled the slots on the engine stream:
+
+| engine bench, two cards, `--mtp 2`, 8-bit KV | slots per layer (first card) | pp2048 | tg64 | tg64 with drafts | CPU pool share |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 32K, before | 40 | 1,082 / 1,321 / 1,308 | 69.4 / 71.3 / 70.2 | 107.2 / 102.1 / 82.2 | 66.5% |
+| 32K, elastic (+ VNNI) | 38 + 36 | 952 / 1,126 / 1,130 | 67.6 / 76.1 / 78.5 | 119.2 / 111.0 / 117.5 | 45.2% |
+| 128K, before | 20 | 1,094 / 1,302 / 1,301 | 63.0 / 67.3 / 67.5 | 94.9 / 93.5 / 96.5 | 79.0% |
+| 128K, elastic | 18 + 35 | 972 / 1,105 / 1,131 | 64.9 / 64.7 / 74.5 | 93.9 / 87.2 / 106.6 | 58.3% |
+| 128K, elastic + VNNI | 18 + 35 | 973 / 1,105 / 1,132 | 67.2 / 70.5 / 74.9 | 104.2 / 97.4 / 107.4 | 58.3% (pool 1,854 -> 1,590 ms) |
+| 262K, before | 0 | 1,129 / 1,282 / 1,277 | 58.2 / 61.3 / 61.2 | 76.1 / 78.5 / 78.7 | 100% |
+| 262K, elastic + VNNI | 0 + 27 | 996 / 1,118 / 1,118 | 60.6 / 67.4 / 67.6 | 92.7 / 98.5 / 99.2 | 74.2% |
+
+(The "before" rows are the 8-bit KV runs above, the same day; the second card's 7 layers are fully resident in
+every row. The drafted figure moves with the text's acceptance rate - 40 of 48 drafts in one run, 32 of 64 in
+another of the same build - so differences under ~10% there are noise; tg64 and the pool share are steadier.)
+Decode gains most where the base slots were fewest: at 262K the first card's layers had no slot at all. The
+prompt rate fell 13%, and timing the switch showed why: 265 ms per prompt, 196 ms of it the extra slots' fill
+(2.1 GiB from the pinned arena at PCIe 3.0 x16 speed), the rest `cudaFree` / `cudaMalloc` of the 2.1 GiB and the
+decode graphs captured again (`STRATA_Q36_NO_ELASTIC=1` on the same build: 1,095 / 1,299 / 1,308).
+
+**The arena.** The elastic region is now one allocation made at the first switch (the free VRAM but 512 MiB; at
+least the chunk's buffers' size, measured as the VRAM their release gave back) and carved: the row set and the
+staging buffers from one end while a prompt runs, the extra slots otherwise, at the same addresses every time, so
+nothing is freed, the decode graphs stay valid and a switch is 27 ms. The fill runs on its own stream and the
+slots go into the tables (`publish_fills`) before the next token.
+
+| engine bench, the final build (arena, fill before the first token, VNNI on) | slots per layer (first card) | pp2048 | tg64 | tg64 with drafts | CPU pool share |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 32K | 38 + 36 | 1,046 / 1,172 / 1,172 | 69.3 / 74.8 / 74.4 | 106.0 / 110.0 / 111.4 | 54.3% |
+| 128K | 18 + 35 | 1,069 / 1,164 / 1,161 | 63.0 / 71.7 / 68.9 | 92.6 / 105.8 / 86.5 (36 of 56 accepted) | 65.5% |
+| 262K | 0 + 30 | 1,019 / 1,152 / 1,152 | 61.9 / 67.4 / 67.1 | 67.7 (31 of 66) / 94.9 / 95.7 | 75.5% |
+
+A switch is 27 ms and the fill 185 ms (168 at 262K, 30 slots). The bench's pp2048 carries the fill (2,048 tokens
+in 1.57 s + 0.19 s: 1,164 tok/s against 1,299 with `STRATA_Q36_NO_ELASTIC=1`); through serve the fill takes the
+place of the base slots' reorganization after the prompt (several hundred swaps on 40 slots there), and a
+2,900-token prompt reads in 3,284 ms against 3,242. Against the 8-bit KV runs before any of this: tg64 +3-10%,
+drafted decode +10% at 32K and +20% at 262K (128K within the noise), pp2048 -11% on the bench.
+
+**A fill behind the first tokens: built, measured, left as an option** (`STRATA_Q36_ASYNC_FILL=1`). The copies
+keep running while decoding starts on the base slots alone; the experts on their way are marked pending (-2) so
+the rebalance does not bring them into a base slot too, and the slots go into the tables at the next rebalance
+boundary (every 32 positions, the copies waited for there) or at the end of serve's prompt-tail batch, so the
+slot tables stay a function of the position as the rebalance keeps them (plain and speculative decoding see the
+same tables). Measured: the prompt time through serve is the same as with the fill before the first token (a
+2,900-token prompt 3,295 / 3,297 ms against 3,292 / 3,278; no elastic 3,240 / 3,244), because the decode's small
+uploads (the pool's rows, every layer) wait for the 1.8 MiB copy in flight: a decode step beside the fill runs at
+about half speed, and so does the tail batch. The engine bench's first 64 tokens after a prompt: 52-58 tok/s
+against 63-75 with the fill done first. Smaller copies did not help: 256 KB pieces cost 440 ms to issue (8,000
+`cudaMemcpyAsync` calls), 1 MB pieces 240 ms.
+
+**Slot swaps.** Three things found on the way, all in `rebalance` / `process`: (1) the scan looked at the top-S
+experts only, which with S base slots and the top ranks pending never reached a candidate - it scans the top
+S + pending now; (2) the counts of a few tokens reorder the middle ranks every time, and the 2,048-swap budget after
+every batch chased them ("batch of 3: 237 slot replacements in 38 ms", 404 after a batch of 35) - a swap now needs
+a clear win (twice the count, and two), and the budget after a small batch is a boundary's (8); after a streamed
+prompt an elastic stage's fill is the reorganization (the base slots follow at the boundaries), a non-elastic
+stage keeps the 2,048. The re-sent conversation test's exact 3-token extension: 60 -> 25 ms.
+
+Through the serve protocol (32K context, the same build; two runs each, ms):
+
+| request | fill before the first token (default) | `STRATA_Q36_ASYNC_FILL=1` | `STRATA_Q36_NO_ELASTIC=1` |
+| --- | ---: | ---: | ---: |
+| 2,900-token prompt | 3,292 / 3,278 | 3,297 / 3,295 | 3,240 / 3,244 |
+| its 32 greedy tokens | 253 / 254 | 250 / 255 | 288 / 283 |
+| the next turn: 10 fresh tokens, 16 out | 65 / 64 + 160 / 159 | 65 / 65 + 168 / 160 | 72 / 72 + 175 / 171 |
+| 116-token prompt, 41 greedy tokens | 423 / 379 | 380 / 378 | 440 / 440 |
+| the same, sampled | 517 / 456 | 465 / 467 | 570 / 598 |
+| a 3-token extension of a short new conversation, 16 out | 25 + 183 / 188 | 25 + 197 / 189 | 26 + 160 / 160 |
+
+The last row is the one place elastic loses: a new short conversation (29 tokens, no switch) runs on extra
+slots filled for the previous, unrelated prompt, and the hysteresis replaces them slowly; a switch (any prompt
+over 32 tokens) refills them.
+
+**The CPU pool's VNNI rows are on by default** where the CPU has AVX-VNNI (`STRATA_KQ_VNNI=0` keeps ggml's path;
+the bits are the same either way: the 48-token parity run matches the reference with both). Above, the 128K
+drafted decode 94 / 87 / 107 -> 104 / 97 / 107 tok/s and the pool's time -14%.
+
+**A draft window never runs past the answer.** The verify window accepted drafts beyond `max_new` and beyond an
+end-of-sequence draft, so the engine's held state was 1-2 tokens longer than the answer it returned and the next
+turn of the conversation was never an exact extension (it fell back to the checkpoint 16 tokens before the prompt's
+end and read the answer again). serve() now offers at most `max_new - produced` drafts, and the MTP chain stops
+at an end-of-sequence draft (`Engine::draft_stop`). The re-sent conversation test: turn B reused 2,884 tokens and
+read 58 in 243 ms before, reuses 2,932 and reads 10 in 77 ms now (as before the review's `live` fix).
+
+The stats line at exit (stderr) now also says: the switches and their time, the fill's time, how long after a
+prompt the extra slots were all in use, and the slot replacements right after batches (`STRATA_Q36_SWAP_DEBUG=1`
+prints them per batch).
+
 ## Future improvements (not done; each with the measurement that motivates it)
 
 - **Prompt attention at long prefixes.** A 40,000-token prompt reads at 700-735 tok/s against ~1,300 for a short
@@ -392,18 +491,25 @@ to end with `STRATA_KQ_VNNI=1` (the GPUs were busy with another benchmark).
   and the first idles while the second runs its resident layers; Flash-Next overlaps the stages' chunks on a
   second host thread (`std::async`, docs/MULTI_GPU.md). Worth ~10% on prompts here (the first card's stream
   dominates).
-- **The CPU pool's kernel, in the engine.** The multi-row kernels above (`STRATA_KQ_VNNI=1`, bit-exact) take the
-  pool from 58-60 GB/s to 69-74 at two rows per job and from 35-41 to 61-68 at four; what that is worth in tokens
-  per second with drafts (`--mtp 2`, few slots) is not measured yet. One row stays ggml's dot: the kernels are no
-  faster there on a P-core and slower on an E-core, so a one-row kernel would need less per-block work (the per-row
-  `std::exp`, the q8s pass and the chain adds are the candidates), or ggml's dot could run on E-cores only.
+- **The CPU pool's one-row kernel.** The multi-row VNNI kernels are in (on by default, measured above); one row
+  stays ggml's dot: the kernels are no faster there on a P-core and slower on an E-core, so a one-row kernel would
+  need less per-block work (the per-row `std::exp`, the q8s pass and the chain adds are the candidates), or ggml's
+  dot could run on E-cores only.
 - **Fewer barriers per layer.** Two pool phases (gate/up rows, then down rows) with a full barrier each, 40 layers
   per token; with ~7 missed experts per layer, whole-expert tasks (one phase) or a pipelined publish would cut
   ~1-2 ms per token.
-- **Expert slots.** At 20-40 slots per layer the first card's hit rate is 20-40%. Per-layer slot counts (layers
-  differ in routing entropy), a warm start from the prompt's routing counts instead of experts 0..S-1, and swaps on
-  the copy stream (today the engine stream + a sync) are the cheap experiments; `--chunk 1024` trades 45% of the
-  prompt rate for 8 more slots.
+- **Expert slots.** The elastic region adds 27-36 slots per layer between prompts (above); its fill costs ~185 ms
+  per streamed prompt on the first card. A fill that yields to the decode's uploads would hide it: the pool's rows
+  could reach the merge kernel from pinned memory directly (no copy command to wait behind), or the fill could
+  go in chunks the copy engine interleaves (measured: thousands of small `cudaMemcpyAsync` calls cost more than they
+  save). Per-layer slot counts (layers differ in routing entropy) and the base slots' reorganization right after
+  a prompt (gradual now: 8 swaps per boundary with hysteresis; whether the prompt's ranks 36-53 beat the previous
+  turn's favorites is not measured) are the other experiments; `--chunk 1024` trades 45% of the prompt rate for 8
+  more slots.
+- **MTP cache for sampled requests without speculative sampling.** A sampled request with penalties (or
+  `STRATA_Q36_NO_SPEC_SAMPLING=1`) decodes through `process(1)`, which skips the MTP block, so its K/V cache has
+  no rows for those positions; a later greedy turn on the same state drafts from a cache with holes (verified,
+  so the text is right, but the acceptance is lower until the prompt refills it).
 - **Packed Q8_0 decode copies on the second card only.** The Q8_0 dense GEMVs are ~4.5 ms of a token; the
   packed layout upstream built them for is "a little faster" but costs 1.8 GiB over both cards; the second card has
   the room at 32K and 128K (not at 262K). Needs per-device packing in load().

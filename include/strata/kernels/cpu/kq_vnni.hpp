@@ -1,7 +1,7 @@
 // include/strata/kernels/cpu/kq_vnni.hpp - AVX-VNNI dot products for the K-quant expert rows of Qwen3.6-35B-A3B
 // UD-Q4_K_XL (Q4_K gate/up, Q5_K / Q6_K down) against Q8_K activations, 1..8 activation rows per pass over the
-// weights, bit-exact against ggml-cpu's AVX2 vec_dot for every row.  See src/kernels/cpu/kq_vnni.cpp.  Opt-in:
-// STRATA_KQ_VNNI=1 (native_expert.cpp), only where cpu_avxvnni_ok().
+// weights, bit-exact against ggml-cpu's AVX2 vec_dot for every row.  See src/kernels/cpu/kq_vnni.cpp.  On where
+// cpu_avxvnni_ok() (native_expert.cpp; STRATA_KQ_VNNI=0 keeps ggml's path).
 #pragma once
 
 #include <cstddef>

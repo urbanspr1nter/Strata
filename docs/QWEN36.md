@@ -24,7 +24,9 @@ it starts and runs well on 8 GB cards, and on two of them.
   speed change on an RTX 2080: the time is weight traffic, not launches). Sampled requests get their top-k from a
   device sort instead of a 1 MB logits copy per token, and **speculative decoding** with the MTP block's drafts
   verified against the sampled distribution (exact: the text is a draw from the same sampler). The CPU pool runs
-  nine row tasks per thread (`--pool-tasks`), with `--pool-affinity auto|p-cores|all` and `--pin-host yes|no`.
+  nine row tasks per thread (`--pool-tasks`), with `--pool-affinity auto|p-cores|all` and `--pin-host yes|no`,
+  and on a CPU with AVX-VNNI its K-quant expert rows go through kernels that take up to 8 tokens per pass over
+  the weights (bit-exact with ggml's; `STRATA_KQ_VNNI=0` keeps ggml's): the pool's time -14% on an i5-13400.
 
 - **Re-sent conversations.** A chat client resends the whole conversation every turn, and the template renders
   the previous answer differently from the tokens the engine generated, so the held state was never an exact
@@ -32,12 +34,23 @@ it starts and runs well on 8 GB cards, and on two of them.
   memory (every GDN layer's conv history and state, ~63 MiB each, up to 8: after every full prompt chunk and 16
   tokens before a prompt's end, where the next turn diverges) and restores the latest one at or before the
   common prefix. Measured: a re-rendered follow-up after a 2,900-token prompt reads 31 tokens in 0.24 s instead
-  of 2,900 in 3.3 s. `STRATA_Q36_PROMPT_TAIL=0` reads prompts in one go as before.
+  of 2,900 in 3.3 s. `STRATA_Q36_PROMPT_TAIL=0` reads prompts in one go as before. A draft window never runs
+  past the answer (the length limit or an end-of-sequence draft), so a turn that extends the answer exactly
+  continues from the held state (10 tokens in 65 ms after that prompt).
 - **An 8-bit KV cache** (`--kv q8_0`; setup writes it for a card under 12 GB or a context past 64K; `--kv f32` is
   upstream's). K and V rows are 8 fp16 scales and 256 int8 (272 bytes instead of 1,024): the same class as
   llama.cpp's q8_0 cache. 262K context fits on two 8 GB cards with it; 128K and 32K get more expert slots.
   Measured (engine bench, short chats): 32K 69-71 tok/s (82-107 with drafts), 128K 63-68 (94-97), 262K 58-61
   (76-79); after a 40,000-token prompt at 262K, 50-54 tok/s and the prompt read at 700-735 tok/s.
+- **Elastic VRAM.** The streamed prompt path's buffers (the 2,048-row chunk and two layers of staging, ~2.1 GiB
+  on the first card) exist only while a prompt longer than 32 tokens runs; between prompts their VRAM holds extra
+  expert slots, filled by routing score after each such prompt (~185 ms over PCIe). Measured (engine bench, two
+  cards, `--mtp 2`, 8-bit KV, before -> with it): 32K 69-71 -> 69-75 tok/s (82-107 -> 106-111 with drafts),
+  128K 63-68 -> 63-72 (94-97 -> 87-106), 262K 58-61 -> 62-67 (76-79 -> 68-96, the first card's layers had no
+  slot at all before); a 2,048-token prompt reads at 1,164 tok/s instead of 1,299 on the bench (its prompt
+  carries the fill; through the server a 2,900-token prompt takes 3.28 s against 3.24 s).
+  `STRATA_Q36_NO_ELASTIC=1` keeps the slots as placed; `STRATA_Q36_ASYNC_FILL=1` fills behind the first tokens
+  (measured no faster through the server: the decode's uploads wait behind the fill's copies).
 - **Long prompts.** The prompt attention sliced a chunk's queries so that their scores over the whole prefix fit
   a 64 MB buffer (10 rows a GEMM at 100K cells) and read the shared K and V once per query head. A prefix longer
   than 16K cells is now read in 16K-cell key chunks with wide query slices, one GEMM per kv head for its 8 query
@@ -95,10 +108,13 @@ dependency; ~2 ms of host overhead. Drafts amortize all of it.
   the second (33 / 39 slots per layer, 7 / 8 resident layers), but the prompt streams the first card's experts
   once per chunk over PCIe: 700 / 350 tok/s instead of 1,290 at 2048. Decode +3-5%.
 - `--max-context`: the cache is allocated for the whole context at start and takes the first card's expert-slot
-  room: with the 8-bit cache 32K leaves 40 slots per layer, 128K 20, 262K none (then every expert of the first
-  card's layers runs on the CPU pool: 58-61 tok/s plain, 76-79 with drafts, instead of 69-71 / 82-107 at 32K).
-  `./setup.sh --setup --context N` changes it; fp32 K/V (`--kv f32`, 45 KB per token) runs up to 64K here.
+  room: with the 8-bit cache 32K leaves 38 slots per layer, 128K 18, 262K none, plus the elastic region's 36 / 35
+  / 30 between prompts (at 262K every expert of the first card's layers ran on the CPU pool before it: 58-61
+  tok/s plain, 76-79 with drafts). `./setup.sh --setup --context N` changes it; fp32 K/V (`--kv f32`, 45 KB per
+  token) runs up to 64K here.
 - `STRATA_Q36_NO_LAYER_GRAPH=1`: the eager decode; `STRATA_Q36_NO_SPEC_SAMPLING=1`: sampled requests one token at
-  a time; `--pool-tasks N`, `--pool-affinity`, `--pin-host no`.
+  a time; `STRATA_Q36_NO_ELASTIC=1`, `STRATA_Q36_ASYNC_FILL=1` (above); `STRATA_KQ_VNNI=0`: ggml's CPU rows;
+  `--pool-tasks N`, `--pool-affinity`, `--pin-host no`. The engine's stats line at exit says how the hybrid
+  batches split between the GPU and the pool, the slot replacements and the elastic switches' time.
 - Host memory: the first card's experts are pinned (15.4 GiB here) and cannot be swapped; a 24 GB swap file was
   added on this PC as a safety net for everything else.

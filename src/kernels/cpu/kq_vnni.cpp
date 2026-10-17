@@ -27,8 +27,8 @@
 // is what binds there; an unpack hoisted before the block loop measured no faster); the pool's DRAM-streaming numbers
 // are in AGENTS_FORK.md (kq_cpu_bench).
 //
-// Only reached behind cpu_avxvnni_ok() and STRATA_KQ_VNNI=1, from two rows on (native_expert.cpp: at one row ggml's
-// dot is as fast on a P-core and faster on an E-core).  Compiled for AVX2 (-mavx2 -mfma -mf16c); the VNNI
+// Only reached behind cpu_avxvnni_ok() (on by default there; STRATA_KQ_VNNI=0 keeps ggml's path), from two rows on
+// (native_expert.cpp: at one row ggml's dot is as fast on a P-core and faster on an E-core).  Compiled for AVX2 (-mavx2 -mfma -mf16c); the VNNI
 // instructions are inside functions with target("avxvnni"), as in iq_avx2.cpp / q2_avx2.cpp (never -mavxvnni on a
 // file: CMakeLists.txt).  A compiler without the intrinsics (STRATA_AVXVNNI=0) gets ggml's madd + add in their
 // place, the same bits.

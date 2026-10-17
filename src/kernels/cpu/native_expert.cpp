@@ -111,8 +111,9 @@ bool q8k_avx1(int type) {
     return on && type == (int) GGML_TYPE_Q8_K;
 }
 // Qwen3.6-35B-A3B UD-Q4_K_XL's K-quant rows (Q4_K gate/up, Q5_K / Q6_K down) on AVX-VNNI, up to 8 tokens per pass
-// over the weights (kq_vnni.cpp): bit-exact against ggml's dot below at any group size (kq_vnni_parity).  Opt-in,
-// STRATA_KQ_VNNI=1, and only where cpu_avxvnni_ok() (Alder Lake and later): the default path stays ggml's.  From
+// over the weights (kq_vnni.cpp): bit-exact against ggml's dot below at any group size (kq_vnni_parity).  On where
+// cpu_avxvnni_ok() (Alder Lake and later; STRATA_KQ_VNNI=0 keeps ggml's path, the same bits): the engine's drafted
+// decode at 128K context 87-94 -> 97-104 tok/s on the i5-13400 (AGENTS_FORK.md, the pool's time -14%).  From
 // two tokens on: at one token the kernels are ggml's speed on a P-core and slower on an E-core (i5-13400,
 // kq_cpu_bench, a 2048 x 512 q4_K/q6_K expert from DRAM: 0.108 -> 0.109 ms and 0.253 -> 0.296 ms), and from two on
 // they are faster on both (P-core 0.189 -> 0.136 ms at two, 0.333 -> 0.177 at four; E-core 0.467 -> 0.404 and
@@ -121,7 +122,7 @@ bool q8k_avx1(int type) {
 bool kq_vnni_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_KQ_VNNI");
-        return v != nullptr && std::atoi(v) != 0 && cpu_avxvnni_ok();
+        return (v == nullptr || std::atoi(v) != 0) && cpu_avxvnni_ok();
     }();
     return on;
 }
