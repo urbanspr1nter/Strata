@@ -265,11 +265,16 @@ __global__ void __launch_bounds__(1024) k_moe_out_small(float* x, const float* p
 
 /// k_group / k_group_hy for n_ent <= 64 entries: one block of 64 threads ranks each entry by (expert id, entry) in
 /// parallel instead of one thread walking all the experts; the same group / entry arrays.  HY: only the entries whose
-/// expert has a VRAM slot (slot_of >= 0), the group's blob at blobs + slot * blob.
+/// expert has a VRAM slot (slot_of >= 0), the group's blob at blobs + slot * blob, or for a slot from S1 on in the second
+/// region (blobs2 + (slot - S1) * blob: the fork's elastic slots, as k_group_hy; S1 = the slot count otherwise).
+__device__ __forceinline__ const uint8_t* slot_blob(const uint8_t* blobs, const uint8_t* blobs2, int S1, int s,
+                                                     unsigned long long blob) {
+    return s < S1 ? blobs + (size_t) s * blob : blobs2 + (size_t) (s - S1) * blob;
+}
 template <bool HY>
 __global__ void k_group_small(const int32_t* ids, int n_ent, int K_, const int32_t* slot_of, const uint8_t* blobs,
                               unsigned long long blob, unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups,
-                              int32_t* ent_dst, int32_t* ent_tok) {
+                              int32_t* ent_dst, int32_t* ent_tok, const uint8_t* blobs2 = nullptr, int S1 = 1 << 30) {
     __shared__ int sid[64];
     const int e = threadIdx.x;
     const int id = e < n_ent ? ids[e] : 0;
@@ -292,7 +297,7 @@ __global__ void k_group_small(const int32_t* ids, int n_ent, int K_, const int32
         int g = 0;
         for (int q = 1; q < rank; ++q) g += sid[q - 1] != sid[q] ? 1 : 0;
         g += rank > 0 ? 1 : 0;
-        grp_ptr[g] = (unsigned long long) (blobs + (size_t) (HY ? slot_of[id] : id) * blob);
+        grp_ptr[g] = (unsigned long long) (HY ? slot_blob(blobs, blobs2, S1, slot_of[id], blob) : blobs + (size_t) id * blob);
         grp_start[g] = rank;
     }
     if (e == 0) {
@@ -310,7 +315,8 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
                                                      float* __restrict__ weights, int n_tok, int ld, const int32_t* slot_of,
                                                      const uint8_t* blobs, unsigned long long blob,
                                                      unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups,
-                                                     int32_t* ent_dst, int32_t* ent_tok) {
+                                                     int32_t* ent_dst, int32_t* ent_tok, const uint8_t* blobs2 = nullptr,
+                                                     int S1 = 1 << 30) {
     constexpr int NE = 256, K = 8, V = NE / 32;
     __shared__ int sids[64], sid[64];
     const int tk = threadIdx.y;
@@ -385,7 +391,7 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
         int g = 0;
         for (int q = 1; q < rank; ++q) g += sid[q - 1] != sid[q] ? 1 : 0;
         g += rank > 0 ? 1 : 0;
-        grp_ptr[g] = (unsigned long long) (blobs + (size_t) (HY ? slot_of[id] : id) * blob);
+        grp_ptr[g] = (unsigned long long) (HY ? slot_blob(blobs, blobs2, S1, slot_of[id], blob) : blobs + (size_t) id * blob);
         grp_start[g] = rank;
     }
     if (e == 0) {
