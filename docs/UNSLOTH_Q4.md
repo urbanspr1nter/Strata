@@ -1,60 +1,66 @@
 # Unsloth UD-Q4_K_XL
 
-A regular size since MODEL-UPDATE Phase 2 (it was experimental): setup offers it from engine 0.1.32
-([below](#setup)); the manual workflow after that section works with engine 0.1.31 or newer. First validated on
-Windows 10, an RTX 5070 (12 GB), 64 GB of RAM and an AVX-512 CPU (2026-10-01); since then on an R9700 (AMD, every
-expert in RAM) and an RTX A4000 (62 GB, the RAM budget) - quality, speed and images in [QUANTS.md](QUANTS.md).
+This page is for people who want to run Unsloth's 4-bit Qwen3.8-Flash-Next file (UD-Q4_K_XL) with Strata, and for
+people who pack it by hand. It also covers UD-IQ4_XS and plain Q4_0 files. For UD-Q5_K_XL, UD-Q6_K_XL and Q8_0, see
+[UNSLOTH_Q6.md](UNSLOTH_Q6.md). Quality, speed and images across the Unsloth sizes are in [QUANTS.md](QUANTS.md).
 
 The target is Unsloth's 4-bit quantization of the same model the other packs use:
 [unsloth/Qwen3.8-Flash-Next-GGUF, `UD-Q4_K_XL`, revision `38bb39e`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/38bb39ee97821de2c9009abb7e93950eec396e66/UD-Q4_K_XL).
-"UD-Q4_K_XL" is a mix of formats, not Q4_K everywhere: the routed experts are Q4_K (Q5_K in layer 2) for gate/up and
-Q5_1 (Q8_0 in layers 2, 4, 30, 46, 47) for down; the token embedding, the output head, the attention and shared-expert
-projections and the PLE key are Q8_0; the 28.8 GB PLE table is IQ4_NL. The routed experts are 71.7 GiB, about twice
-the 3-bit models'.
+"UD-Q4_K_XL" is a mix of formats, not Q4_K everywhere:
 
-## Setup
+- Routed experts: Q4_K (Q5_K in layer 2) for gate/up, Q5_1 (Q8_0 in layers 2, 4, 30, 46, 47) for down. They are
+  71.7 GiB, about twice the 3-bit models'.
+- Token embedding, output head, attention and shared-expert projections, and the PLE key: Q8_0.
+- The 28.8 GB PLE table: IQ4_NL.
 
-`START-HERE.bat --setup` (Linux: `./setup.sh --setup`) and choose **Qwen3.8-Flash-Next (Unsloth)**; or directly:
+## Quick start
+
+Run `strata launch` and choose **Qwen3.8-Flash-Next (Unsloth)**, or:
 
 ```sh
-START-HERE.bat --setup --family unsloth --model UD-Q4_K_XL
+strata launch --family unsloth --model UD-Q4_K_XL
 ```
 
-What setup does differently for this model:
+## What setup does
 
-- Every expert in RAM where its 72 GiB of experts and 16 GiB more fit the RAM (~88 GB: no `--resident-budget-gib`;
-  the rule is sergqwer's fork's, MIT), else the RAM budget below. It needs 48 GB of RAM or more (with less it asks,
-  default no; `--model UD-Q4_K_XL --yes` installs it anyway) and engine 0.1.32 or newer (checked before anything is
-  downloaded). NVIDIA or AMD: it ran on an R9700 too (#429's question is gone). One GPU by default in the budget mode
-  (the tested setup); on several, see the next point. No experimental speed projection (not tested with it). Images
-  (#967) are on by default on an NVIDIA card of 16 GB or more and on AMD (CPU encoder) where every expert fits in RAM;
-  run end to end on CUDA and HIP (QUANTS.md).
-- Several GPUs, with an engine that keeps the resident RAM copy on a layer split (0.1.40 and newer, #642): the RAM
-  budget is kept on the split. Each card caches the experts of its own layers, and the budget holds the hottest of
-  the rest by the whole expert profile (the experts no card holds), so any RAM works as on one card. Setup asks (one
-  GPU stays the default; `--gpus 0,1`, "2" at setup or "y" when a start offers both cards takes the split), and a
-  start on several GPUs keeps `--resident-budget-gib`. Measured on an RTX 3090 (x16) + RTX 3080 Ti (x4), 91 GB of RAM,
-  budget 64 GiB, engine 0.1.41: decode 45 tok/s against 38 on the 3090 alone (the auto split gives the x4 card two
-  layers); 57.6 GiB of experts in RAM, no file reads per request.
-- Several GPUs with an older engine (#498): when the RAM holds the GGUF files and 24 GB more (~135 GB of RAM) and two or more cards can
-  share it, setup asks (one GPU stays the default; `--gpus 0,1` takes the split). The split runs **without** the RAM budget: all 77 GB of experts are loaded into RAM from the GGUFs at
-  start, the files pass through the OS file cache while they load, and the config gets `"gpu": [0, 1]` and
-  `"layer_split": "auto"`. Measured on 2x RTX 3090 with 165 GiB (#498): decode 31 tok/s on one card with the budget,
-  64-78 tok/s split (55 tok/s at a 128K prompt), with `MemAvailable` never under 68 GiB. With less RAM, `--gpus`
-  keeps one GPU and says so, and `START-HERE.bat --gpus 0,1` on an installed UD-Q4_K_XL stops with the reason
-  (it used to keep the budget, and the engine exited with code 2).
-- It downloads the four shards below from the pinned revision `38bb39e` (resumable, like the other models), then
-  checks each one's size and SHA-256 against the table below; the check takes a few minutes once and is remembered
-  in the file's finish mark. A file with the wrong hash is deleted, so the next run downloads it again.
-- It packs with `--compat-bf16` and never writes `experts.bin` (`--low-ram` does not apply).
-- The RAM budget (below ~88 GB of RAM) is the PC's RAM less 24 GB: `--resident-budget-gib 40` on 64 GB, at most all 71 GiB of experts on
-  a PC that asks for a budget. From a 64K context up, where the KV cache moves to RAM, its size comes out of the budget. Setup's
-  `--resident-budget-gib N` sets another one (a bigger one is kept, with a note on what it risks).
-- It recommends an 8K context on a GPU under 14 GB (every GB of KV cache is a GB less of cached experts).
+- **Where the experts live.** Every expert goes into RAM when its 72 GiB plus 16 GiB more fit (about 88 GB of RAM). On a
+  PC with less RAM, or on a unified-memory APU, setup keeps a RAM budget: the hottest experts in RAM, the rest read
+  from the GGUF on the SSD. It fits when its files (without the n-gram table) are no bigger than your graphics memory and RAM together; then the menu says "fits", otherwise "may run slower" and setup asks (default no), and
+  `--model UD-Q4_K_XL --yes` installs it anyway.
+- **The RAM budget** is the PC's RAM less 17 GB (`--resident-budget-gib 47` on 64 GB; 0.2.16 and earlier: less 24 GB, 40), at most all 71 GiB of experts. From
+  a 64K context up, where the KV cache moves to RAM, its size comes out of the budget. `--resident-budget-gib N` at
+  setup sets another one; a bigger one is kept, with a note on what it risks. The reading is rounded up to the size the PC is sold with where it
+  is within 3% under it (a "64 GB" Windows PC reads 63.1 GiB, Linux 62.5 to 63.7: both give 47; a PC with 60 GB gives 43).
+- **Which mode gets which number (0.2.17).** `--resident-budget-gib` in the run config is the RAM less 17 GB (47 on 64 GB): the Terminal (`strata launch`,
+  `strata serve`, Docker) and the app's "Full performance" run with it. The app's "Leave 20% for my work" runs with the number of the earlier rule, the RAM
+  less 24 GB (40 on 64 GB; 24 on 48 GB, 8 on 32 GB), which setup writes beside it as `"ui_budget_work_gib"`; the app starts the engine with it in that mode, on the started copy only (the saved run config keeps the first number, so a Terminal start of the same file reads it)
+  and "Full performance" starts with the first. The key is left out where the two numbers are the same (a unified-memory GPU keeps 24 in both; 96 GB and up keep every expert in RAM) and when
+  you asked setup for a budget (`--resident-budget-gib N`, or one in the config's `user_args`, or an edit of `args`): yours is used in both modes, as is a `--ram-keep-gib`,
+  `STRATA_RAM_KEEP_GIB` or `STRATA_RESIDENT_HEADROOM_GIB` of yours. A run config of 0.2.16 (setup's 40, no second number) is moved once, at the first
+  command of the new Control after the update: 40 becomes 47 and `"ui_budget_work_gib": 40` is added, so "Leave 20% for my work" keeps 40
+  (32 GB: 8 -> 15 and 8; 48 GB: 24 -> 31 and 24). A number you set, a unified-memory PC and a layer split are not touched; the earlier file is kept as `.bak`.
+- **Download.** The four shards below from the pinned revision `38bb39e`, resumable. Setup checks each one's size and
+  SHA-256 against the table below once and remembers it in the file's finish mark. A file with the wrong hash is
+  deleted, so the next run downloads it again.
+- **Packing.** `--compat-bf16`, and never an `experts.bin` (`--low-ram` does not apply).
+- **Defaults it writes** into the run config's `env`: `STRATA_ROUTE_TAIL_SKIP=0` (the tail skip off) in every mode since
+  0.2.17. Before that it wrote it only where every expert is in RAM, and not on Linux AMD gfx12 (R9700, RX 9000), where the
+  engine's own default (the skip on, rank 7) ran: UD-Q4_K_XL decoded 6-16% faster there at an unchanged 61-task suite.
+  `STRATA_ROUTE_TAIL_SKIP=7` turns it on (KL and speed numbers: [DETAILS.md](DETAILS.md#route-tail-skip-strata_route_tail_skip-off-by-default-since-0217)).
+  UD-Q4_K_XL keeps `STRATA_MMQ_KQ`
+  opt-in in the config (the Linux gfx12 engine takes it by itself since 0.2.10.1). Setup no longer writes `STRATA_HC_Q8`:
+  on NVIDIA the engine itself reads the file's own Q8_0 hyper-connection projections (closer to the file and faster) for
+  files that carry them as Q8_0, and `STRATA_HC_Q8=0` restores the BF16 read.
+- **Context.** It recommends 8K on a GPU under 14 GB, because every GB of KV cache is a GB less of cached experts.
+- **GPUs.** NVIDIA or AMD. One GPU is the default in the budget mode. With several GPUs, each card caches the experts of
+  its own layers and the budget holds the hottest of the rest by the whole expert profile. Setup asks; `--gpus 0,1`
+  takes the split, and a start on several GPUs keeps `--resident-budget-gib`.
+- **Pictures.** The reader is the CPU one below 24 GB of VRAM and the GPU one from 24 GB, when the package has a reader.
+  No experimental speed projection is used with this file.
 
 ## The files
 
-Four shards, 111,334,654,784 bytes (111.3 GB) together. Shard 1 holds only the metadata; layer 11's down projection is
+Four shards, 111,334,654,784 bytes (111.3 GB) together. Shard 1 holds only the metadata. Layer 11's down projection is
 in shard 2 and its gate/up in shard 3, which this engine handles (`native_experts.txt` v4).
 
 | File | Bytes | SHA-256 |
@@ -64,60 +70,63 @@ in shard 2 and its gate/up in shard 3, which this engine handles (`native_expert
 | `Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf` | 49,376,141,504 | `56758f40269cad5cd9b0d3d6fbae0f40f6d5be6de49e4ab392dbe83157d9cbd3` |
 | `Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf` | 12,087,983,520 | `753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a` |
 
-Keep the four files together in one folder under these names (the engine finds shards 2-4 from shard 1's name; a
-missing shard is an error that names it). Setup checks them itself; by hand, check them before packing
-(`sha256sum -c`, or `Get-FileHash` on Windows).
-Hugging Face snapshot symlinks work if you pass the snapshot's file name, not the hash-named blob it points to.
+Keep the four files together in one folder under these names. The engine finds shards 2 to 4 from shard 1's name, and a
+missing shard is an error that names it. By hand, check the files before packing (`sha256sum -c`, or `Get-FileHash` on
+Windows). Hugging Face snapshot symlinks work if you pass the snapshot's file name, not the hash-named blob it points to.
 
 ## What it needs
 
 | | |
 | --- | --- |
-| Disk | 111.3 GB for the four files, 1.4 GB for the pack, ~6 GB for the MTP draft layer if you have none yet. **No `experts.bin`**: the engine reads the experts from the GGUF files in place. An NVMe SSD matters: the experts that fit neither VRAM nor the RAM budget are read from it for every token. |
-| RAM | 64 GB measured. The RAM budget (below) holds the most-used experts; the rest come from the SSD through the OS file cache. |
-| GPU | 12 GB measured (RTX 5070): after the weights, the draft layer and the buffers, the expert cache held 1,280 of the 24,576 experts (3.7 GiB) at 4K context. |
+| Disk | 111.3 GB for the four files, 1.4 GB for the pack, about 6 GB for the MTP draft layer if you have none yet. There is **no `experts.bin`**: the engine reads the experts from the GGUF files in place. An NVMe SSD matters, because experts that fit neither VRAM nor the RAM budget are read from it for every token. |
+| Memory | Its files (without the n-gram table) no bigger than your graphics memory and RAM together, or the menu says "may run slower"; about 88 GB of RAM for every expert in RAM. The RAM budget holds the most-used experts and the rest come from the SSD through the OS file cache. |
+| GPU | 12 GB works: after the weights, the draft layer and the buffers, the expert cache held 1,280 of the 24,576 experts (3.7 GiB) at 4K context on an RTX 5070. |
 
 ## The pack (by hand)
 
-Build Strata (or install 0.1.31+), then, from the repository root, with gguf-py from the pinned llama.cpp
-(setup installs it; `STRATA_GGUF_PY` can point to its `gguf-py` folder):
+Build Strata, then from the repository root (the pack tools carry their own gguf-py;
+`STRATA_GGUF_PY` can point to another `gguf-py` folder):
 
 ```sh
-.venv/bin/python tools/iq_pack.py \
+terminal/.venv/bin/python terminal/tools/iq_pack.py \
   --gguf /path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --out packs/ud-q4_k_xl --compat-bf16
 ```
 
-About 30 seconds. It writes `index.txt`, `dense.bin` (1.4 GB), `native_experts.txt`, the tokenizer, `conversions.json`
-and `compat-bf16.json`. **`--compat-bf16` is required**: this file stores 195 small projections (the hyper-connection
-up/down matrices, `output_hc_*` and the PLE value) as Q8_0, while the engine reads them as BF16. Without the flag the
-packer refuses and writes nothing; with it, they are dequantized and rounded to BF16 (nearest-even). Do not add
-`--experts-bin`: it would write a 77 GB copy of the experts that this mode does not need.
+It takes about 30 seconds and writes `index.txt`, `dense.bin` (1.4 GB), `native_experts.txt`, the tokenizer,
+`conversions.json` and `compat-bf16.json`. **`--compat-bf16` is required.** This file stores 195 small projections (the
+hyper-connection up/down matrices, `output_hc_*` and the PLE value) as Q8_0, while the engine reads them as BF16.
+Without the flag the packer refuses and writes nothing. With it, they are dequantized and rounded to BF16
+(nearest-even). Do not add `--experts-bin`: it would write a 77 GB copy of experts that this mode does not need.
 
 ## The numbers: what is native and what is converted
 
 The routed experts, the token embedding, the output head, the attention and shared-expert projections, the PLE key and
-the PLE table are used as the GGUF stores them (the engine has GPU kernels and CPU (ggml) paths for Q4_K, Q5_K, Q5_1 and
-Q8_0). The small tensors the engine reads as floats are converted, and `conversions.json` lists every one with its
-source/destination type, method, whether it is exact, the largest absolute error and the source bytes' SHA-256:
-264 F32 tensors (routers, injections, SSM gates) whose values are already BF16's are stored as BF16 exactly; the 195
-Q8_0 projections above are rounded to BF16 (largest absolute error 0.0144, in `hc_ffn_up`); the PLE convolution (F32)
-is narrowed to F16 when the engine loads it (largest error 3e-8). That is the compatibility Unsloth's file needs; it is
-not the original BF16 checkpoint. The output matches llama.cpp's on the same file:
-[Quality](#quality-against-llamacpp-on-the-same-file).
+the PLE table are used as the GGUF stores them. The engine has GPU kernels and CPU (ggml) paths for Q4_K, Q5_K, Q5_1 and
+Q8_0.
+
+The small tensors the engine reads as floats are converted. `conversions.json` lists every one with its source and
+destination type, method, whether it is exact, the largest absolute error and the source bytes' SHA-256:
+
+- 264 F32 tensors (routers, injections, SSM gates) whose values are already BF16's are stored as BF16 exactly.
+- The 195 Q8_0 projections above are rounded to BF16 (largest absolute error 0.0144, in `hc_ffn_up`).
+- The PLE convolution (F32) is narrowed to F16 when the engine loads it (largest error 3e-8).
+
+That is the compatibility Unsloth's file needs. It is not the original BF16 checkpoint. The output matches llama.cpp's on
+the same file ([Quality](#quality-against-llamacpp-on-the-same-file)).
 
 ## The MTP draft layer
 
-The draft layer is the base model's, the same one the other packs use. If setup installed Strata, you have it
-(`mtp/rt` in `Strata-data`). Otherwise build it as [docs/ORCA.md](ORCA.md#preparation) shows (`tools/mtp_fetch.py`,
-`tools/mtp_pack.py`, `tools/mtp_rt.py`, then copy `data/draft_vocab.bin` to `mtp/rt/`).
+The draft layer is the base model's, the same one the other packs use. If setup installed Strata, you have it (`mtp/rt`
+in `Strata-data`). Otherwise build it as [ORCA.md](ORCA.md#preparation) shows (`terminal/tools/mtp_fetch.py`,
+`terminal/tools/mtp_pack.py`, `terminal/tools/mtp_rt.py`, then copy `terminal/data/draft_vocab.bin` to `mtp/rt/`).
 
 ## The server
 
 Save as `strata-ud-q4_k_xl.json` at the repository root (or next to setup's other `strata-*.json`), with `/path/to/`
 pointing at **shard 1**. `--ple-gguf` is not needed: the engine finds the shard that holds the PLE table
-(`per_layer_token_embd.weight`, shard 2) by name. `--resident-budget-gib` turns on the mapped mode with a RAM budget
-(it implies `--mmap-experts`).
+(`per_layer_token_embd.weight`, shard 2) by name. `--resident-budget-gib` turns on the mapped mode with a RAM budget (it
+implies `--mmap-experts`).
 
 ```json
 {
@@ -126,7 +135,7 @@ pointing at **shard 1**. `--ple-gguf` is not needed: the engine finds the shard 
     "--pack", "packs/ud-q4_k_xl",
     "--native", "/path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
     "--resident-budget-gib", "40",
-    "--expert-profile", "data/expert-profile.bin", "--expert-cache", "auto",
+    "--expert-profile", "terminal/data/expert-profile.bin", "--expert-cache", "auto",
     "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
     "--mtp", "mtp/rt", "--max-context", "8192"
   ],
@@ -140,64 +149,57 @@ pointing at **shard 1**. `--ple-gguf` is not needed: the engine finds the shard 
 ```
 
 ```sh
-.venv/bin/python -m serve.server --engine strata --config strata-ud-q4_k_xl.json --port 8080
+terminal/.venv/bin/python terminal/serve/server.py --engine strata --config strata-ud-q4_k_xl.json --port 8080
 ```
 
-(`engine/strata.exe` is setup's engine on Windows; a self-built one is `build/strata`.) The expert profile is the base
-model's (`data/expert-profile.bin`); it ranks the same 48 x 512 experts and decides which ones the GPU cache and the RAM
+`engine/strata.exe` is setup's engine on Windows; a self-built one is `build/strata`. The expert profile is the base
+model's (`terminal/data/expert-profile.bin`). It ranks the same 48 x 512 experts and decides which ones the GPU cache and the RAM
 budget take first.
 
-**Choosing the RAM budget N:** your RAM minus 20-24 GB (the OS, the engine itself, the 126 MB router copy, and room for
-the OS file cache that serves the rest). On 64 GB, 40. The engine checks available RAM and, on Windows, available
-commit capacity. If N exceeds the smaller value minus 4 GiB headroom, it reduces N to that amount minus a 256 MiB
-margin and reports which limit applies. Before #403's fix a clamped budget could then fail the safety check.
-Everything above N comes from the SSD for every token, so N is the setting that matters
-most; a bigger budget was faster in every measurement (24 / 32 / 40 GiB). When the driver page-locks the whole budget
-(24 GiB did on this PC, 32 and 40 did not), the GPU also computes a share of the misses over PCIe, as in the resident
-low-RAM mode; `STRATA_RESIDENT_PIN=0` uses ordinary pageable memory (the CPU then computes every miss).
+**Choosing the RAM budget N.** Setup uses your RAM minus 17 GB (the OS, the engine itself, the 126 MB router copy, and
+room for the OS file cache that serves the rest). On 64 GB that is 47 (0.2.16 and earlier: minus 24 GB, 40). The engine checks available RAM and, on Windows,
+available commit capacity. If N exceeds the smaller value minus 4 GiB headroom, it reduces N to that amount minus a
+256 MiB margin and reports which limit applies. Everything above N comes from the SSD for every token, so N is the
+setting that matters most; a bigger budget was faster in every measurement (24 / 32 / 40 GiB).
 
-On Windows, the allocation log reports available physical RAM and commit capacity before allocation and after a
-failure. Free RAM alone does not guarantee that Windows can commit the requested memory. If the pageable fallback
-also fails, the warning preserves both the GPU allocation or mapping error and the `malloc` error.
+Under a real 64 GiB memory limit (a cgroup the engine reads; UD-Q4_K_XL, an RTX PRO 4500 Blackwell with an 8,171-slot expert cache,
+48 GiB of experts outside the cache; `phaseA-tests/bw/RESULTS-BW-D.md`):
 
-**Context:** measured at 4K. The KV cache takes VRAM from the expert cache, so a longer context makes decoding slower;
-8K is a reasonable start on 12 GB. `--kv int8` halves the KV cache's VRAM.
+| setup rule on 64 GB | N | SSD read in a 65K-token prompt | 4K-token prompt | decode, mean of 5 kinds | engine anon+shmem | free of the 64 GiB |
+|---|---|---|---|---|---|---|
+| RAM less 24 (0.2.16) | 40 | 97.7 GB | 3,169 ms | 57.7 tok/s | 47.4 GiB | 16.6 GiB |
+| RAM less 17 | 47 | 37.0 GB | 2,873 ms | 84.2 tok/s | 54.7 GiB | 9.3 GiB |
+| RAM less 12 | 52 | 0.9 GB | 2,138 ms | 83.4 to 88.6 tok/s | 57.4 GiB | 6.6 GiB |
 
-## What to expect (RTX 5070 12 GB, 64 GB RAM, Windows, one short greedy prompt)
+So "Full performance" and the Terminal read 9.3 GiB free of 64 with N 47, and "Leave 20% for my work" 16.6 GiB with N 40 (decode 84.2 and 57.7 tok/s).
 
-| RAM budget | Greedy output | Notes |
-| --- | --- | --- |
-| 24 GiB | 5.1-5.2 tok/s (2 runs, before the routing prefetch below) | 2.2 GB read from the SSD per verify round (~3.5 tokens) |
-| 40 GiB | **7-8.5 tok/s** (6 runs: 6.7-8.6, mean 7.9) | 1.1 GB read from the SSD per verify round, ~0.33 GB per token |
+A program that took 8 GiB after the engine had started: N 47 and 40 ran on, N 52 was killed by the kernel (the engine reads
+the free RAM at its start and lowers an N that does not fit then, not later). On Windows the engine takes the smaller of
+available RAM and available commit; for `--resident-budget-gib` its headroom is 4 GiB and the margin 256 MiB, so a PC
+with A GiB available at the start runs N at most A - 4.25 (setup writes no `STRATA_RESIDENT_HEADROOM_GIB`): on a 64 GB Windows PC (reads 63.1) with 55 GiB
+available N 47 holds (room 50.75), with 50 GiB available it is 45.75, and N 40 ("Leave 20% for my work") holds from 44.25 GiB available.
+Setup does not count the experts of the card's own cache: the rule is the same for every card, and N above the experts
+outside the cache is not used (47.9 GiB on that card, about 63 GiB on a 12 GB card).
 
-- The first answer comes about 60 s after the engine starts (mostly loading: the RAM budget is copied from the GGUF
-  files at start). A 30-token prompt then took 5-6 s.
-- Long prompts (engine 0.1.32): a 16K prompt is read at **160 tokens/s** (15,873 tokens in 99 s; 0.1.31: 57 tokens/s,
-  273-282 s). Reading a prompt streams every expert once per 4K chunk, and the third of them outside the RAM budget
-  come from the SSD (~35 GB per chunk), so the prompt path now reads them with 32 threads and up to 128 blobs in
-  flight when the experts are read from the GGUF in place (`STRATA_STAGER_THREADS` / `STRATA_STAGER_RING` override
-  it; 4 and 16 before, still the default for every other model). Between the chunks, the 28.8 GB PLE table's rows
-  take ~5 s per chunk.
-- With `STRATA_MMQ_KQ=1` the engine multiplies the Q4_K / Q5_K / Q5_1 experts of a prompt with llama.cpp's MMQ
-  kernels (as the other models' formats always are) instead of dequantizing them to FP16: 4x less GPU time for those
-  products, but on this PC the prompt waits for the SSD either way (29 s per 4K chunk with or without). Opt-in: it
-  rounds differently from the FP16 path. On CUDA these kernels are a library next to the engine (`libstrata_kq.so` /
-  `strata_kq.dll`), opened only then, so they take no VRAM from other models ([QUANTS.md](QUANTS.md)); before, they were
-  the build option `-DSTRATA_MMQ_KQUANTS=ON` and took 1-3 expert slots from every model.
-- The speed varies from run to run (6.7-8.6 tok/s at 40 GiB for the same prompt), with what the OS file cache holds.
-- For comparison, IQ3_S (all its experts in RAM) writes ~53 tok/s on the same PC ([the speed tables](DETAILS.md#speed-measured)).
-- Where the time goes (`--stats` on the command line): at 40 GiB about 550-750 ms of each verify round (3.5 tokens) is
-  reading experts from the SSD, ~75 ms the CPU's expert kernels, ~13 ms the GPU.
+When the driver page-locks the whole budget, the GPU also computes a share of the misses over PCIe, as in the resident
+low-RAM mode. `STRATA_RESIDENT_PIN=0` uses ordinary pageable memory instead, and the CPU then computes every miss. On
+Windows the allocation log reports available physical RAM and commit capacity before allocation and after a failure,
+because free RAM alone does not guarantee that Windows can commit the requested memory.
+
+**Context.** The KV cache takes VRAM from the expert cache, so a longer context makes decoding slower. 8K is a reasonable
+start on 12 GB. `--kv int8` halves the KV cache's VRAM.
 
 ## Quality: against llama.cpp on the same file
 
-Strata and llama.cpp (the pinned commit `3cf0325`, a CPU build reading the GGUF memory-mapped) were given the same
-token sequences, and at every position each wrote its 20 most likely next tokens with their log-probabilities: Strata
-through its verify windows (`STRATA_LOGPOS` with `STRATA_LOGPOS_TOPK=20`), llama.cpp from `llama_get_logits_ith` over
-one batch. Strata ran with the recommended settings (RAM budget 40 GiB, the MTP draft layer on, greedy,
-`--adapt-every 100000` so the expert cache does not move during the run). Per position: whether the most likely token is the same (argmax
-agreement), how many of the 5 / 10 most likely tokens both have, the KL divergence (llama.cpp's distribution against
-Strata's, over llama.cpp's top 20 plus one bucket for the rest), and the perplexity of the sequence under each.
+> **Measured on:** Strata 0.1.32 era engine against llama.cpp pinned commit `3cf0325` (CPU build, GGUF memory-mapped).
+> Strata ran with RAM budget 40 GiB, the MTP draft layer on, greedy and `--adapt-every 100000`. Hardware is not recorded
+> on this page.
+
+Both were given the same token sequences, and at every position each wrote its 20 most likely next tokens with their
+log-probabilities. Strata used its verify windows (`STRATA_LOGPOS` with `STRATA_LOGPOS_TOPK=20`), llama.cpp used
+`llama_get_logits_ith` over one batch. Per position: whether the most likely token is the same (argmax agreement), how
+many of the 5 and 10 most likely tokens both have, the KL divergence (llama.cpp's distribution against Strata's, over
+llama.cpp's top 20 plus one bucket for the rest), and the perplexity of the sequence under each.
 
 | Token set | Positions | Argmax agreement | Top-5 / top-10 overlap | KL | Perplexity Strata / llama.cpp |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -207,43 +209,44 @@ Strata's, over llama.cpp's top 20 plus one bucket for the rest), and the perplex
 | Real text after a 16K prompt: the last 510 tokens of 16,384 tokens of this repository's docs and code | 510 | 91.2% | 88.3% / 89.9% | 0.035 | 4.27 / 4.29 |
 | The same 511 positions with only 512 tokens before them | 511 | 89.2% | 86.0% / 86.3% | 0.061 | 8.99 / 8.87 |
 
-For comparison, [eddoursul/Strata](https://github.com/eddoursul/Strata) reported 98.2-99.3% (code), 95.6-95.8%
+For comparison, [eddoursul/Strata](https://github.com/eddoursul/Strata) reported 98.2 to 99.3% (code), 95.6 to 95.8%
 (thinking) and 97.7% (after a 16K prompt) for the same file against llama.cpp on an RTX 3090.
 
-**Where they differ:** at near-ties. Grouped by llama.cpp's own gap between its two most likely tokens, Strata picks
-the same token at every position of the code and thinking answers where that gap is 0.2 or more (695 of 695) and at
-every position after the 16K prompt where it is 0.5 or more (144 of 144 in the continuation, 254 of 254 in the real
-text; 50 of 54 and 117 of 121 between 0.2 and 0.5). Text after a long document has many more near-ties than a short
-answer (58 of the continuation's 256 positions and 135 of the real text's 510 have a gap under 0.2, against 13 of the
-code answer's 400), which is why its agreement is lower. It is not the long context itself: the same real-text
-positions after only 512 tokens agree a little less (89.2%), and the perplexities match within 3% in every set. For
-scale, Strata's own greedy run and its teacher-forced rerun of the continuation pick different tokens at 6% of the
-positions (93.8% the same: other window sizes, other experts in VRAM), the same kind of near-tie flips. The 16K
-prompts were read by Strata's batched prompt path (15,872 tokens), the rest through the verify windows. These numbers
-are the FP16 prompt path's (the released engine's); with the MMQ prompt path (`-DSTRATA_MMQ_KQUANTS=ON`, above) the
+The two differ at near-ties. Where llama.cpp's own gap between its two most likely tokens is 0.2 or more, Strata picks
+the same token at every position of the code and thinking answers (695 of 695). After the 16K prompt it does so at every
+position where the gap is 0.5 or more (144 of 144 in the continuation, 254 of 254 in the real text). Text after a long
+document has many more near-ties than a short answer (58 of the continuation's 256 positions and 135 of the real text's
+510 have a gap under 0.2, against 13 of the code answer's 400), which is why its agreement is lower. The perplexities
+match within 3% in every set. The 16K prompts were read by Strata's batched prompt path (15,872 tokens), the rest
+through the verify windows. These numbers are the FP16 prompt path's. With the MMQ prompt path (`STRATA_MMQ_KQ=1`) the
 continuation after the 16K prompt agrees at 92.2% (KL 0.029, three runs, identical).
 
-To repeat it: Strata's side is `STRATA_LOGPOS=<file>` with `STRATA_LOGPOS_TOPK=20` (engine 0.1.32) on a serve
-engine with `--short-read` covering the positions to compare; llama.cpp's side was a short program over
-`llama_decode` / `llama_get_logits_ith` writing the same top 20 per position.
+To repeat it, set `STRATA_LOGPOS=<file>` with `STRATA_LOGPOS_TOPK=20` on a serve engine with `--short-read` covering the
+positions to compare. llama.cpp's side was a short program over `llama_decode` and `llama_get_logits_ith` writing the
+same top 20 per position.
 
 ## Opt-ins and switches (environment variables)
 
-| | |
+| Variable | Effect |
 | --- | --- |
-| `STRATA_LOOKAHEAD=0` | Turns off the routing-aware prefetch (on by default in this mode): while the CPU works on a layer, a thread applies the next layer's router to this layer's input and asks the OS to read the predicted experts' pages. Pages only, the answers are the same. About half of the SSD reads were predicted; mean +14% (6.9 -> 7.9 tok/s). `STRATA_LOOKAHEAD_K` sets the experts per token (default 10). |
+| `STRATA_LOOKAHEAD=0` | Turns off the routing-aware prefetch (on by default in this mode). While the CPU works on a layer, a thread applies the next layer's router to this layer's input and asks the OS to read the predicted experts' pages. Pages only; the answers are the same. `STRATA_LOOKAHEAD_K` sets the experts per token (default 10). |
 | `STRATA_KQ256=1` | Multi-token AVX2 kernels for the Q4_K / Q5_1 / Q8_0 experts. Bit-exact with ggml's, but measured no faster, so off. |
-| `STRATA_KQ_VNNI=1` | AVX-VNNI kernels for Q4_K, Q5_K and Q6_K expert rows (Qwen3.6-35B-A3B UD-Q4_K_XL: Q4_K gate/up, Q5_K / Q6_K down), the activation rows inside the block loop so a block's weights are unpacked once for up to 8 rows. Bit-exact with ggml's dots (`kq_vnni_parity`). CPUs with AVX-VNNI only (Alder Lake and later; `cpu_avxvnni_ok`). From two rows on (one row: ggml's dot, the same bits). Measured on an i5-13400 P-core with a 2048 x 512 expert in cache: 1.4-1.5x ggml at two rows, 1.9-2.0x at four, 2.0-2.2x at eight (`kq_vnni_parity --bench`); the pool over 2 GB of experts from DRAM with 10 threads: 58-60 -> 69-74 GB/s of weights at two rows per job, 35-41 -> 61-68 at four (`kq_cpu_bench`, the table in AGENTS_FORK.md). Off by default: the default path stays ggml's. |
-| `STRATA_PARTIAL_PIN=1` | Registers the hottest part of the RAM budget (up to `STRATA_PARTIAL_PIN_GIB`, default 24) with the GPU driver, so the GPU computes a share of the misses over PCIe (`--pcie-frac`). Measured no faster on this PC, and it changes the numerics of those experts (GPU kernels instead of the CPU's), so off. |
-| `STRATA_FETCH_THREADS=N` | Threads that read the experts from the GGUF while it answers (default 8; 16 was no faster). The prompt path has its own: `STRATA_STAGER_THREADS` (default 32 here) and `STRATA_STAGER_RING` (128). |
+| `STRATA_KQ_VNNI=0` | Turns off the AVX-VNNI kernels for Q4_K, Q5_K and Q6_K expert rows (Qwen3.6-35B-A3B UD-Q4_K_XL: Q4_K gate/up, Q5_K / Q6_K down), the activation rows inside the block loop so a block's weights are unpacked once for up to 8 rows. Bit-exact with ggml's dots (`kq_vnni_parity`). CPUs with AVX-VNNI only (Alder Lake and later; `cpu_avxvnni_ok`). From two rows on (one row: ggml's dot, the same bits). Measured on an i5-13400 P-core with a 2048 x 512 expert in cache: 1.4-1.5x ggml at two rows, 1.9-2.0x at four, 2.0-2.2x at eight (`kq_vnni_parity --bench`); the pool over 2 GB of experts from DRAM with 10 threads: 58-60 -> 69-74 GB/s of weights at two rows per job, 35-41 -> 61-68 at four (`kq_cpu_bench`, the table in AGENTS_FORK.md). On by default where the CPU has AVX-VNNI; `STRATA_KQ_VNNI=0` keeps ggml's dots (the same bits). |
+| `STRATA_PARTIAL_PIN=1` | Registers the hottest part of the RAM budget (up to `STRATA_PARTIAL_PIN_GIB`, default 24) with the GPU driver, so the GPU computes a share of the misses over PCIe (`--pcie-frac`). Measured no faster, and it changes the numerics of those experts, so off. |
+| `STRATA_FETCH_THREADS=N` | Threads that read the experts from the GGUF while it answers (default 8). The prompt path has its own: `STRATA_STAGER_THREADS` (default 32 here) and `STRATA_STAGER_RING` (128). |
+| `STRATA_RESIDENT_PIN=0` | Ordinary pageable memory for the RAM budget, also for the RAM copy the engine makes on its own (see above). |
 
-## UD-IQ4_XS (setup from 0.1.39, #621)
+## UD-IQ4_XS
 
-Unsloth's `UD-IQ4_XS` at the same revision is in setup too, as a regular choice (not experimental; the Unsloth
-family's first size and its default): `START-HERE.bat --setup --family unsloth --model UD-IQ4_XS` (engine 0.1.38 or
-newer). It sits between IQ3_S and UD-Q4_K_XL: its routed experts are IQ3_S gate/up (IQ4_XS
-in one layer) with IQ4_NL downs (Q8_0 in five layers), 59.5 GB of them; the dense side (Q8_0 projections, the IQ4_NL
-PLE table, a Q6_K head) is UD-Q4_K_XL's. Three shards, 93.7 GB:
+Unsloth's `UD-IQ4_XS` at the same revision is in setup as a regular choice, the Unsloth family's first size:
+
+```sh
+strata launch --family unsloth --model UD-IQ4_XS
+```
+
+It sits between IQ3_S and UD-Q4_K_XL. Its routed experts are IQ3_S gate/up (IQ4_XS in one layer) with IQ4_NL downs (Q8_0
+in five layers), 59.5 GB of them. The dense side (Q8_0 projections, the IQ4_NL PLE table, a Q6_K head) is UD-Q4_K_XL's.
+Three shards, 93.7 GB:
 
 | File | Bytes | SHA-256 |
 | --- | ---: | --- |
@@ -251,37 +254,37 @@ PLE table, a Q6_K head) is UD-Q4_K_XL's. Three shards, 93.7 GB:
 | `Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf` | 49,835,229,856 | `577a38a2392b40ca2193cea502e1d92f60b8cd370675d308e0ec21885d9daaa7` |
 | `Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf` | 43,836,407,744 | `d4634e6d84f0ebb0940be15c90d3790bf6464e3dea3a1cddc567dc0e83ad8833` |
 
-Setup treats it like UD-Q4_K_XL (the list above): the same RAM budget (your RAM less 24 GB; at most all 55 GiB of its
-experts, so a PC with ~80 GB of RAM or more holds all of them), the pack with `--compat-bf16`, no `experts.bin`, one
-GPU by default (several keep the budget, as above). It does not ask on AMD: its experts' formats have prompt kernels there too. Images are an option (asked,
-off by default; NVIDIA): the image path has no restriction for this pack, which uses the original model's image
-encoder; not yet run with images.
+Setup treats it like UD-Q4_K_XL: the same RAM budget rule (your RAM less 17 GB, at most all 55 GiB of its experts, so a
+PC with about 72 GB of RAM or more holds all of them), the pack with `--compat-bf16`, no `experts.bin`, and one GPU by
+default. It uses the original model's image encoder.
 
-What is known so far: it packs and runs on a Strix Halo (AMD gfx1151, 128 GB unified memory), where prompts read at
-~820 tokens/s at 8K and 64K and the answers passed the retrieval checks at 8K and 64K. It has **not** been measured on
-NVIDIA yet; please report what you see. One fidelity note that applies to every `--compat-bf16` pack (UD-Q4_K_XL too):
-the pack rounds the file's Q8_0 hyper-connection projections to BF16, and on the Strix Halo that rounding put
-perplexity 6-9% above llama.cpp's on the same file (teacher-forced, short context). Reading the Q8_0 values instead
-closes most of that gap; it is measured on AMD only and not in this release.
+It packs and runs on a Strix Halo (AMD gfx1151, 128 GB unified memory), where prompts read at about 820 tokens/s at 8K
+and 64K and the answers passed the retrieval checks at 8K and 64K. It has not been measured on NVIDIA; please report
+what you see.
+
+One fidelity note applies to every `--compat-bf16` pack, UD-Q4_K_XL included. The pack rounds the file's Q8_0
+hyper-connection projections to BF16, and on the Strix Halo that put perplexity 6 to 9% above llama.cpp's on the same
+file (teacher-forced, short context). On NVIDIA the engine reads the file's Q8_0 values instead of the rounded BF16 by default. The 6 to 9% gap was measured on AMD.
 
 ## Q4_0 files
 
-A plain `llama-quantize` Q4_0 file of this model runs the same way: pack shard 1 with `--compat-bf16` as above and
-point `--native` at it. Tested:
+A plain `llama-quantize` Q4_0 file of this model runs the same way: pack shard 1 with `--compat-bf16` as above and point
+`--native` at it. Tested:
 [bartowski/Qwen3.8-Flash-Next-GGUF, `Qwen3.8-Flash-Next-Q4_0`, revision `928589f`](https://huggingface.co/bartowski/Qwen3.8-Flash-Next-GGUF/tree/928589fdb66c6ff07f22ac561e3fbce76553548f/Qwen3.8-Flash-Next-Q4_0)
-(3 shards, 100.6 GB). Its routed experts are Q4_0 for gate/up and for down, except down in layers 0-5, which is Q4_1;
-the PLE table and the token embedding are Q4_0. The pack serves 302 tensors from the GGUF as stored and converts 362
+(3 shards, 100.6 GB). Its routed experts are Q4_0 for gate/up and for down, except down in layers 0 to 5, which is Q4_1.
+The PLE table and the token embedding are Q4_0. The pack serves 302 tensors from the GGUF as stored and converts 362
 (168 exact, 194 rounded to BF16, largest absolute error 0.0156; 1.23 GiB).
 
 The Q4_0 expert kernels centre the codes (q - 8) before the integer dot product, as ggml-cpu's Q4_0 x Q8_0 dot does,
-instead of llama.cpp's CUDA form (uncentred codes, minus 8 x the Q8_1 block sum in float); Q4_1 follows the Q5_1
-kernel without the fifth bit. `native_expert_parity` on this file (layers 0 and 5: Q4_0/Q4_1, layers 20 and 47:
-Q4_0/Q4_0): relative error against the float product 1.1-1.3e-2 on the CPU and the GPU alike, CPU vs GPU 1.1e-7 for
-Q4_0/Q4_0 and 5e-4 to 1.1e-3 with Q4_1 down.
+instead of llama.cpp's CUDA form (uncentred codes, minus 8 x the Q8_1 block sum in float). Q4_1 follows the Q5_1 kernel
+without the fifth bit. `native_expert_parity` on this file (layers 0 and 5: Q4_0/Q4_1, layers 20 and 47: Q4_0/Q4_0)
+gives a relative error against the float product of 1.1 to 1.3e-2 on the CPU and the GPU alike, and CPU against GPU of
+1.1e-7 for Q4_0/Q4_0 and 5e-4 to 1.1e-3 with Q4_1 down.
 
-Measured on one RTX 3060 12 GB (PCIe 3.0 x16), Xeon E5-2696 v4, 121 GiB DDR4-2400, Linux, CUDA 12.4; every expert in
-RAM, `--max-context 131072 --kv int8 --kv-resident 20480`, expert cache `auto` (1,960 slots, 5.06 GiB), prompt chunk
-`auto` (6,144 tokens); greedy, `reasoning_effort` medium, one request at a time:
+> **Measured on:** one RTX 3060 12 GB (PCIe 3.0 x16), Xeon E5-2696 v4, 121 GiB DDR4-2400, Linux, CUDA 12.4. Every
+> expert in RAM, `--max-context 131072 --kv int8 --kv-resident 20480`, expert cache `auto` (1,960 slots, 5.06 GiB),
+> prompt chunk `auto` (6,144 tokens), greedy, `reasoning_effort` medium, one request at a time. Strata version not
+> recorded.
 
 | Prompt | Prompt read | Output |
 | --- | --- | --- |
@@ -290,28 +293,61 @@ RAM, `--max-context 131072 --kv int8 --kv-resident 20480`, expert cache `auto` (
 | 24,461 tokens | 787 tok/s | 24.0 tok/s |
 | 67,934 tokens (a fact hidden in the middle: found) | 737 tok/s | 26.4 tok/s |
 
-A coding prompt was answered correctly. Not measured: agreement with llama.cpp on this file (as
-[above](#quality-against-llamacpp-on-the-same-file) for UD-Q4_K_XL), AMD, Windows, and bartowski's Swift-1.5 Q4_0,
-whose header shows the same formats.
+A coding prompt was answered correctly. Not measured: agreement with llama.cpp on this file, AMD, Windows, and
+bartowski's Swift-1.5 Q4_0, whose header shows the same formats.
 
 ## Scope and validation
 
-- UD-Q4_K_XL and UD-IQ4_XS at revision `38bb39e` are targeted, and plain Q4_0 files ([above](#q4_0-files)). Other
-  quantizations use formats this engine may not have kernels for; the engine checks every layer's formats at start
-  and refuses an unsupported one by name.
-- Tests: the packer's synthetic 4-shard and conversion tests (`.venv/bin/python -m unittest discover -s tools -p
-  test_iq_pack.py`); CTests `gguf_split_test`, `expert_layout_test`, `native_expert_parity_*` (the three real expert
-  format pairs against ggml-cpu, the Q5_1 min term, Q8_0 rows, Q4_0/Q4_0 and Q4_0/Q4_1), `prefill_mmq_kquant_test` (with `-DSTRATA_MMQ_KQUANTS=ON`: the
-  prompt path's MMQ products for Q4_K / Q5_K / Q5_1 / Q8_0 against ggml's dequantized weights); the in-place mode against `experts.bin` on the Coder
-  (identical tokens and logits).
-- Real runs: greedy answers to a coding prompt (correct) at every budget and setting above, identical across them;
-  the same tokens as llama.cpp at 97.5-99% of the positions of short greedy answers and 90-91% after a 16K prompt,
-  differing mostly at near-ties (above). Not yet: sampled decoding, long conversations. Please report what you see.
+- UD-Q4_K_XL and UD-IQ4_XS at revision `38bb39e` are targeted, and plain Q4_0 files. Other quantizations use formats this
+  engine may not have kernels for. The engine checks every layer's formats at start and refuses an unsupported one by
+  name.
+- Tests: the packer's synthetic 4-shard and conversion tests
+  (`terminal/.venv/bin/python -m unittest discover -s tools -p test_iq_pack.py`) and the CTests `gguf_split_test`,
+  `expert_layout_test`, `native_expert_parity_*` (the three real expert format pairs against ggml-cpu, the Q5_1 min term,
+  Q8_0 rows, Q4_0/Q4_0 and Q4_0/Q4_1).
+- Not validated: sampled decoding and long conversations. Please report what you see.
 
 ## Credits
 
 The split-artifact loader, the expert formats' GPU kernels and the packing of Unsloth's files follow
 [eddoursul/Strata](https://github.com/eddoursul/Strata) (PR #245), which ran these files first. The Q8_0 kernels, the
-per-role shard column and the PLE convolution's F32 -> F16 fix come from @gopinath87607's PR #255; per-role shard names
+per-role shard column and the PLE convolution's F32 to F16 fix come from @gopinath87607's PR #255. Per-role shard names
 were also proposed by @jagsan-cyber in PR #247. The quantization is [Unsloth](https://huggingface.co/unsloth)'s; the
 model is Qwen's ([license](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)).
+
+## History / older measurements
+
+### RAM budget, speed on a 12 GB card
+
+> **Measured on:** RTX 5070 12 GB, 64 GB RAM, Windows 10, AVX-512 CPU, UD-Q4_K_XL, one short greedy prompt, first
+> validation (2026-10-01, engine 0.1.31/0.1.32).
+
+| RAM budget | Greedy output | Notes |
+| --- | --- | --- |
+| 24 GiB | 5.1 to 5.2 tok/s (2 runs, before the routing prefetch) | 2.2 GB read from the SSD per verify round (about 3.5 tokens) |
+| 40 GiB | 7 to 8.5 tok/s (6 runs: 6.7 to 8.6, mean 7.9) | 1.1 GB read from the SSD per verify round, about 0.33 GB per token |
+
+- The first answer comes about 60 s after the engine starts (the RAM budget is copied from the GGUF files at start). A
+  30-token prompt then took 5 to 6 s.
+- A 16K prompt was read at 160 tokens/s (15,873 tokens in 99 s) on engine 0.1.32, up from 57 tokens/s (273 to 282 s) on
+  0.1.31, after the prompt path began reading experts with 32 threads and up to 128 blobs in flight.
+- The routing-aware prefetch added a mean of +14% (6.9 to 7.9 tok/s); about half of the SSD reads were predicted.
+- With `STRATA_MMQ_KQ=1` the products took 4x less GPU time, but on this PC the prompt waited for the SSD either way (29 s
+  per 4K chunk).
+- Where the time goes at 40 GiB (`--stats`): about 550 to 750 ms of each verify round (3.5 tokens) reading experts from
+  the SSD, about 75 ms the CPU's expert kernels, about 13 ms the GPU.
+- For comparison, IQ3_S (all its experts in RAM) wrote about 53 tok/s on the same PC
+  ([the speed tables](DETAILS.md#speed-measured)).
+
+### Two GPUs with the RAM budget
+
+> **Measured on:** RTX 3090 (x16) + RTX 3080 Ti (x4), 91 GB RAM, budget 64 GiB, engine 0.1.41.
+
+Decode 45 tok/s against 38 on the 3090 alone (the auto split gives the x4 card two layers); 57.6 GiB of experts in RAM,
+no file reads per request.
+
+> **Measured on:** 2x RTX 3090, 165 GiB RAM, an older engine that ran the split without the RAM budget (all 77 GB of
+> experts loaded into RAM at start).
+
+Decode 31 tok/s on one card with the budget, 64 to 78 tok/s split (55 tok/s at a 128K prompt), with `MemAvailable` never
+under 68 GiB.
