@@ -77,7 +77,7 @@ split the last layers live entirely on the second card (their dense weights, KV 
 nothing when all of their experts are resident, and the residual crosses once per batch (8 KiB per row) through
 pinned host memory. The CPU pool stays shared. Flash-Next's own split (docs/MULTI_GPU.md) is the same shape.
 
-What changed in `src/qwen35/q36_engine.cu` (the single-device `Engine` became `Stage`, one per card, driven by a
+What changed in `engine/src/qwen35/q36_engine.cu` (the single-device `Engine` became `Stage`, one per card, driven by a
 new `Engine`):
 
 - `--layer-split auto|K|0` and `--split-device D`. `auto` (the default whenever two GPUs are visible) prices the
@@ -335,7 +335,7 @@ choice (20 slots: 94-97 tok/s with drafts in short chats).
 
 ## 2026-10-16 - the CPU pool's K-quant rows on AVX-VNNI, several tokens per pass (`STRATA_KQ_VNNI=1`, opt-in)
 
-`src/kernels/cpu/kq_vnni.cpp`: Q4_K, Q5_K and Q6_K rows against Q8_K activations (this model's gate/up and down
+`engine/src/kernels/cpu/kq_vnni.cpp`: Q4_K, Q5_K and Q6_K rows against Q8_K activations (this model's gate/up and down
 projections) for 1..8 activation rows per pass over the weights, bit-exact against ggml-cpu's AVX2 dots
 (`kq_vnni_parity`: 0 of 27,540 kernel values and 0 of 184,320 engine-entry-point values differ, on blocks from ggml's
 quantizers and on random bytes, 1..8 rows, whole and partial row ranges). The design: ggml's integer chain is exact
@@ -493,7 +493,7 @@ Three tests of the fork's engine against llama.cpp b11559 with the user's own ll
 -t 10`), the same UD-Q4_K_XL file, the same PC, the same day. The fork ran as the user runs it: two cards,
 `--layer-split auto`, 128K context, `--kv q8_0`, `--mtp 2`, through the server with its API key.
 
-**Teacher-forced next-token distributions** (`tools/qwen35/tf_compare.py` with `tools/qwen35/q36_llama_dump.cpp`,
+**Teacher-forced next-token distributions** (`terminal/tools/qwen35/tf_compare.py` with `terminal/tools/qwen35/q36_llama_dump.cpp`,
 which now takes `--n-cpu-moe`, `--tensor-split`, `--threads`, `--kv q8_0`, `--batch`/`--ubatch` so that the
 reference is llama.cpp placed as llama-server places it). Four token sequences: the first 837 tokens of *Alice in
 Wonderland* (prose the model has memorized: perplexity 1.5), 965 tokens of `serve/server.py` (code), 1,508 tokens
@@ -521,7 +521,7 @@ region, the eager decode, nearly every expert on the CPU pool (`--expert-slots 1
 hybrid batch - all land in the same band (KL mean 0.037-0.058, top-1 95.8-96.7%): none of the fork's paths moves
 the distribution, and the eager and graph paths are bit-identical.
 
-**Needle in a haystack by depth** (`tools/needle_bench.py`: the repository's own text as filler, a code word at
+**Needle in a haystack by depth** (`terminal/tools/needle_bench.py`: the repository's own text as filler, a code word at
 10 / 50 / 90% of the text, thinking off, greedy): 8K, 32K, 64K and 120K-token prompts.
 
 | prompt | Strata (two cards, 128K, 8-bit K/V) | llama-server (262K, q8_0 K/V) |
@@ -531,7 +531,7 @@ the distribution, and the eager and graph paths are bit-identical.
 | 64K | found / found / found (67 / 67 / 67 s) | found / found / found (211 / 211 / 211 s) |
 | 120K (117,427 tokens) | found / found / found (159 / 159 / 159 s) | found / found / found (415 / 416 / 415 s) |
 
-**GSM8K, thinking on** (`tools/gsm8k_eval.py`: the first 40 test problems, temperature 0.6 / top-p 0.95 / top-k
+**GSM8K, thinking on** (`terminal/tools/gsm8k_eval.py`: the first 40 test problems, temperature 0.6 / top-p 0.95 / top-k
 20 as Qwen recommends for thinking, one seed per problem, at most 6,144 tokens, the answer the last `\boxed{}`):
 
 | | correct | hit the 6,144-token limit | completion tokens, mean / median | reasoning, mean chars | decode (the server's own) | 40 problems |
@@ -558,6 +558,45 @@ then: the first card's layers 0-34 with no base slot and 30 elastic slots, the s
 every expert): 160K, 200K and 250K-token prompts (158,206 / 200,217 / 252,286 tokens), the code word at 10 / 50 /
 90% - 9 of 9 found; the prompts read in 257-259 s, 379-380 s and 565-566 s (610 / 527 / 446 tok/s: the prompt
 attention's share grows with the prefix).
+
+## 2026-11-22 - merged with upstream Strata 0.2.19
+
+Upstream (Niko1221/Strata, 6,216 commits past the fork point 296b59d2f) moved the tree to `app/`, `engine/`,
+`terminal/` and removed llama.cpp's MMQ from the tree. The merge keeps the fork's Stage engine (the layer split) and
+ports upstream's Qwen3.6 engine work onto it, one commit each: the small fixes; the prompt experts on upstream's
+fused and int8 kernels (the fork's prompt path was MMQ-only); sessions, `--batch` / `--batch-mtp`, pictures
+(`--vision`) and the decode kernels of `q36_kernels.cuh`. Setup keeps the fork's two-GPU, 8-bit-KV install on
+upstream's `install_own_path`.
+
+Measured on 2x RTX 2080 + i5-13400 + 32 GB DDR5-6000, UD-Q4_K_XL, same day:
+
+| | prompt | decode | decode, 2 drafts |
+| --- | ---: | ---: | ---: |
+| engine bench, 32K, `--kv q8_0`, fork before the merge (MMQ) | pp2048 1,180 tok/s | tg64 76.5 | 111-112 |
+| the same, merged, before the prompt kernels (no MMQ) | 493 | 70.6 | 96-102 |
+| the same, merged (fused int8 prompt experts) | 1,189-1,195 | 70.4-76.3 | 115-120 |
+| plain upstream, one card, 8K (32K does not fit its fp32 KV cache) | 305 | 49.8 | - |
+| server, 262K config: chats / 4K / 16K prompts | 1,155 / 1,317 tok/s | 79-89 | - |
+
+Decode kernels of upstream's set, one at a time on this PC (engine bench tg128, two reps): the one-warp-per-row Q8_0
+products 75.7 / 76.5 tok/s against 78.5-78.9 / 79.8-79.9 without, k_moe_out_small 80.8 / 81.8, the rest level; so the
+warp-per-row products run from compute capability 8 on (`STRATA_Q36_Q8_ROWS=1` / `0`).
+
+Checked: the parity reference's greedy text unchanged through every step; two prompts alone and in two batch slots
+identical with fixed slots (`STRATA_Q36_FIXED_SLOTS=1 --expert-slots 13 --layer-split 30`), with `--batch-mtp` too
+(with dynamic slots they can differ: the slot tables differ between the runs, and GPU and CPU experts round
+differently); a synthetic 4x4 picture gives the same text on one card, two cards and with drafts, and with
+`STRATA_Q36_ATTN=v1` the same text as upstream's own engine. Teacher-forced KL against llama.cpp's dumps of
+2026-10-16 (GPU reference / CPU reference; floor 0.0414, 0.00273, 0.00404, 0.00557): prose 0.0555 / 0.0414, code
+0.00293 / 0.00303, tech 0.00423 / 0.00398, chat 0.00467 / 0.00510 - at the floor except prose against the GPU
+reference (its median 0.00028: a few near-tie tokens; the fork's own variants of that text ranged 0.037-0.058). A
+22.7K-token needle through the server was found.
+
+Not checked: `--batch` through the server (at 262K one session's cache is 3.1 GiB, so several need a shorter
+context), real pictures (no mmproj / strata-vision on this PC), the AMD and Windows builds. Upstream's single-card
+fit checks (`one_session_fit`, `hybrid_plan`) are not used: the split prices each card itself. Setup's context
+recommendation (`strata_control/own_path_fit.py`) assumes one card and fp32 KV, so it suggests 8K on an 8 GB card
+(a recommendation only; `--context` decides).
 
 ## Future improvements (not done; each with the measurement that motivates it)
 

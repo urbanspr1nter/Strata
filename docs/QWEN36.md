@@ -141,7 +141,7 @@ More numbers are in [History](#history--older-measurements).
 
 ## Testing
 
-The gates are in `tools/qwen35/` and talk to the engine through its serve protocol (no server needed). Run them under
+The gates are in `terminal/tools/qwen35/` and talk to the engine through its serve protocol (no server needed). Run them under
 the box's GPU lock.
 
 | Script | Checks |
@@ -253,7 +253,12 @@ gives the base engine's text for 2 of 6, `--prefill 512` for 6 of 6.
 
 ## Qwen3.6-35B-A3B on one or two small cards (this fork)
 
-Qwen3.6-35B-A3B has its own engine path in Strata (`src/qwen35/q36_engine.cu`, chosen from the GGUF's
+> Merged with upstream Strata 0.2.19 on 2026-11-22: upstream's pictures, several requests at once (`--batch`,
+> `--batch-mtp`) and its fused int8 prompt kernels now run on this fork's layer split and 8-bit KV cache. What was
+> measured and checked after the merge: AGENTS_FORK.md ("merged with upstream Strata 0.2.19"). The numbers below are
+> from before the merge.
+
+Qwen3.6-35B-A3B has its own engine path in Strata (`engine/src/qwen35/q36_engine.cu`, chosen from the GGUF's
 architecture `qwen35moe`): no pack, no expert profile, the Unsloth GGUF read as it is, the routed experts in VRAM
 where they fit and otherwise in a pinned host arena with VRAM slots for the most-used ones and a CPU pool for the
 rest (the hybrid mode), and the file's own MTP block for drafts. This page is about what this fork changed so that
@@ -358,12 +363,12 @@ with 2 drafts 68-80. After a 14,000-token prompt: 56-61 tok/s (61-64 with drafts
 ### Accuracy against llama.cpp (the same GGUF, the same PC, 2026-10-16)
 
 Teacher-forced next-token distributions on four sequences (memorized prose, code, a document, a chat; 160 to
-1,408 steps each; `tools/qwen35/tf_compare.py`): Strata's distance from llama.cpp's GPU run (b11559, the user's
+1,408 steps each; `terminal/tools/qwen35/tf_compare.py`): Strata's distance from llama.cpp's GPU run (b11559, the user's
 llama-server placement) is the distance between llama.cpp's own GPU and CPU runs - KL mean 0.0028-0.044 against
 the floor's 0.0027-0.041, top-1 agreement 96.0-98.1% against 95.8-97.5%, perplexities equal to the third digit
-(code 4.322 / 4.314, document 6.621 / 6.587). Needle in a haystack (`tools/needle_bench.py`) at 8K, 32K, 64K and
+(code 4.322 / 4.314, document 6.621 / 6.587). Needle in a haystack (`terminal/tools/needle_bench.py`) at 8K, 32K, 64K and
 120K tokens, depths 10 / 50 / 90%: 12 of 12 found by both engines, the 120K prompt read in 159 s here against 415 s there; at the 262K configuration 160K, 200K and 250K-token prompts at the same depths, 9 of 9 found (the 250K prompt read in about 9.5 minutes). GSM8K, the first 40 test problems with thinking on
-(`tools/gsm8k_eval.py`, Qwen's sampling, 6,144-token limit): 37 of 40 against llama-server's 35 of 40, median
+(`terminal/tools/gsm8k_eval.py`, Qwen's sampling, 6,144-token limit): 37 of 40 against llama-server's 35 of 40, median
 1,335 against 1,425 completion tokens, 94.7 against 60.4 tok/s. AGENTS_FORK.md has the tables.
 
 Where a decoded token's time goes (nsys, short context): ~6.5 ms of GPU kernels (the Q8_0 dense GEMVs near the
