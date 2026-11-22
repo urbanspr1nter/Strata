@@ -16,6 +16,7 @@
 //
 // Modes: --serve (serve/server.py's engine protocol: READY / GEN / T / DONE / STOP / PP), --tokens IDS [--n N]
 // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
+#include "strata/artifact/dequant.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/core/on_device.hpp"
@@ -27,6 +28,8 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/qwen35/engine.hpp"
+#include "strata/qwen35/expert_info.hpp"
+#include "strata/qwen35/sampling.hpp"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -1095,8 +1098,15 @@ float* upload_f32(const strata::TensorInfo& t, const uint8_t* src) {
             const float d = f16_to_f32((uint16_t) (q[0] | (q[1] << 8)));
             for (int j = 0; j < 32; ++j) h[b * 32 + j] = d * (float) (int8_t) q[2 + j];
         }
+    } else if (((t.type >= 11 && t.type <= 14) || t.type == 23) && h.size() % 256 == 0) {
+        // Q3_K..Q6_K, IQ4_XS (mixed GGUFs store ssm_alpha / ssm_beta so): 256-value super-blocks
+        static const struct { void (*f)(const uint8_t*, float*); size_t bytes; } kq[] = {
+            {strata::dequantize_q3_K, 110}, {strata::dequantize_q4_K, 144}, {strata::dequantize_q5_K, 176},
+            {strata::dequantize_q6_K, 210}, {strata::dequantize_iq4_xs, 136}};
+        const auto& k = kq[t.type == 23 ? 4 : t.type - 11];
+        for (size_t b = 0; b < h.size() / 256; ++b) k.f(src + b * k.bytes, h.data() + b * 256);
     } else {
-        std::fprintf(stderr, "strata-q36: %s is %s, expected F32, BF16, F16 or Q8_0\n", t.name.c_str(), t.type_name());
+        std::fprintf(stderr, "strata-q36: %s is %s, expected F32, BF16, F16, Q8_0, Q3_K..Q6_K or IQ4_XS\n", t.name.c_str(), t.type_name());
         std::exit(1);
     }
     float* d = nullptr;
@@ -1418,12 +1428,7 @@ size_t stage_batch_bytes(const strata::core::ModelGeometry& g, int64_t top_k, bo
     return b;
 }
 
-struct Sampling {
-    float temperature = 0.f, top_p = 1.f, min_p = 0.f, repeat = 1.f, freq = 0.f, present = 0.f;
-    int top_k = 20, last_n = 0;
-    unsigned long long seed = 0;
-    bool needs_logits() const { return temperature > 0.f || repeat != 1.f || freq != 0.f || present != 0.f; }
-};
+using strata::qwen35::Sampling;
 
 struct Engine;
 
@@ -2675,7 +2680,9 @@ struct Engine {
     int hybrid_swaps_after_prompt = 2048;
     int rb_swaps = 0;      // slot replacements right after prompts, and their time (stats)
     double rb_ms = 0;
-    bool (*draft_stop)(int) = nullptr;   // a draft this returns true for ends the window (serve: the end of the answer)
+    bool (*draft_stop)(int) = nullptr;
+    // #5012: the expert placement, for the INFO line (the Monitor's "expert cache: slots / experts"; strata/qwen35/expert_info.hpp)
+    strata::qwen35::ExpertInfo expert_info;   // a draft this returns true for ends the window (serve: the end of the answer)
     // graphs: [0] the decode step, [T] a verify window of T rows (one stage only), mtp1 the MTP draft step
     cudaGraphExec_t g1 = nullptr, gv[kVerify + 1] = {}, gm1 = nullptr;
 #if defined(STRATA_Q36_CPU_POOL)
@@ -3134,9 +3141,12 @@ struct Engine {
         const auto t0 = Clock::now();
         set_warming(true);
         const int32_t filler = 198;   // a newline: any token works
-        std::vector<int32_t> toks((size_t) tmax, filler);
+        // #4708: the prompt chunk may equal or exceed the context (--context 2048 with a 2048-token chunk): warm only cells that
+        // exist, and start the small-prompt, decode and speculative probes in a fresh sequence instead of appending past the cache.
+        std::vector<int32_t> toks((size_t) std::max(1, std::min(tmax, ctx)), filler);
         process(toks.data(), (int64_t) toks.size(), [](int64_t) {});
-        if (tmax > Stage::kGemmT + 1) process(toks.data(), Stage::kGemmT + 1, [](int64_t) {});   // the smallest GEMM chunk too
+        reset();
+        if (tmax > Stage::kGemmT + 1 && ctx > Stage::kGemmT + 1) process(toks.data(), Stage::kGemmT + 1, [](int64_t) {});   // the smallest GEMM chunk too
         process(&filler, 1, [](int64_t) {});
         if (mtp_d > 0) {
             std::vector<int32_t> fix, drafts;
@@ -3615,16 +3625,7 @@ int sample_from(const float* top, const int32_t* ids, int kk, const Sampling& s,
 }
 
 int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
-    if (s.last_n != 0 && (s.repeat != 1.f || s.freq != 0.f || s.present != 0.f)) {
-        std::map<int, int> cnt;
-        const size_t from = s.last_n < 0 || (size_t) s.last_n >= hist.size() ? 0 : hist.size() - (size_t) s.last_n;
-        for (size_t i = from; i < hist.size(); ++i) ++cnt[hist[i]];
-        for (const auto& [id, c] : cnt) {
-            float& v = lg[(size_t) id];
-            if (s.repeat != 1.f) v = v > 0 ? v / s.repeat : v * s.repeat;
-            v -= (float) c * s.freq + s.present;
-        }
-    }
+    strata::qwen35::apply_penalties(lg, s, hist);
     if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
     const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
     std::vector<int32_t> idx(lg.size());
@@ -3667,6 +3668,7 @@ bool is_eos(int t) { return t == 248044 || t == 248046; }
 
 // ------------------------------------------------------------------------------------------------ serve
 int serve(Engine& E) {
+    if (E.expert_info.experts > 0) std::fputs(strata::qwen35::expert_info_line(E.expert_info).c_str(), stdout);   // #5012
     std::printf("READY %d stop\n", E.ctx);
     std::fflush(stdout);
     std::mutex mu;
@@ -3790,7 +3792,10 @@ int serve(Engine& E) {
         live.insert(live.end(), ids.begin() + (long) reuse, ids.end());
         const double prompt_ms = ms_since(t0);
         std::mt19937_64 rng(smp.seed);
-        std::vector<int32_t> hist = ids;
+        // #4590: the penalties count the reply's tokens (and the fed-back last prompt token), not the prompt; STRATA_PENALTY_PROMPT=1
+        // restores the old window.  `ids` is the request's full prompt whether or not the state was resumed.
+        static const bool pen_prompt = strata::kernels::penalty_counts_prompt(std::getenv("STRATA_PENALTY_PROMPT"));
+        std::vector<int32_t> hist = strata::qwen35::penalty_history_start(ids, pen_prompt);
         const auto d0 = Clock::now();
         long long produced = 0, offered = 0, accepted = 0;
         const char* finish = "length";
@@ -4004,6 +4009,7 @@ int strata::qwen35::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
     }
+    E.expert_info = strata::qwen35::expert_info(m.layers, m.g.n_expert);   // #5012: what the placement left in VRAM (base slots)
 #if defined(STRATA_Q36_CPU_POOL)
     // the host thread spins on the routing event and drains pool tasks itself: pinned to the pool's reserved core
     // (the first physical core), so it never lands on a worker's core or SMT sibling (Flash-Next's session does
