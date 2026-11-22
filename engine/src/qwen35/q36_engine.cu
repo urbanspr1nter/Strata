@@ -25,7 +25,13 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/q36_prompt_route.hpp"
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/moe_fused.hpp"
+#include "strata/prefill/fused_tile_rule.hpp"
+#include "strata/prefill/own_only_switches.hpp"
+#include "strata/prefill/moe_fused_q36.hpp"
+#include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/qwen35/engine.hpp"
 #include "strata/qwen35/expert_info.hpp"
@@ -70,6 +76,8 @@ namespace {
 
 namespace K = strata::kernels;
 namespace MMQ = strata::prefill::mmq;
+namespace PF = strata::prefill::fused;          // the grouping and the int8 sizes (shape-free)
+namespace FQ = strata::prefill::fused_q36;      // the fused kernels for Qwen3.6's shape (CUDA)
 
 #define CK(x)                                                                                                          \
     do {                                                                                                               \
@@ -1461,6 +1469,10 @@ struct Stage {
         int32_t *ids = nullptr, *grp_start = nullptr, *n_groups = nullptr, *ent_dst = nullptr, *ent_tok = nullptr,
                 *tok = nullptr, *ident = nullptr, *rinv = nullptr;
         unsigned long long* grp_ptr = nullptr;
+        // the prompt chunk's fused / int8 expert routes (upstream's, see use_pf): the grouping tables, the input and H in
+        // the fused kernels' int8 form, the entries' rows, and the int8 kernels' activation image
+        void *f_scr = nullptr, *f_xq = nullptr, *f_ha = nullptr, *i8x = nullptr;
+        int32_t *f_slot = nullptr, *f_src = nullptr;
     };
     RowSet rows_big, rows_small;
     bool elastic = false;      // the prompt chunk's buffers only while a streamed prompt runs (see enter_*_phase)
@@ -1514,7 +1526,18 @@ struct Stage {
     int att_tq_chunk = 0;              // query rows a slice takes on the chunked path
     float *att_m = nullptr, *att_l = nullptr, *att_alpha = nullptr, *att_part = nullptr;
     __half* att_qg = nullptr;          // the slice's queries grouped by kv head
-    // the prompt's MMQ experts
+    // the prompt's experts on Strata's fused int8 kernels (moe_fused_iq_q36.cu) where they cover a layer (fused_on), else our
+    // int8 expert kernels (i8_on, native_expert_i8), else MMQ where the build has it, else the native grouped kernels (the route
+    // of each layer: q36_layer_route, include/strata/kernels/q36_prompt_route.hpp; upstream's since 0.2.16, which has no MMQ in
+    // the tree).  use_pf: every layer of this stage has one of the fast routes, so a hybrid stage streams each layer's experts
+    // for a chunk (the strategy MMQ had alone before)
+    std::vector<char> fused_on, i8_on;   // by state index (the MTP block last)
+    size_t n_i8 = 0, n_fused = 0;
+    int i8_few = 0;                      // native_expert_i8_few_rows_limit()
+    bool use_pf = false;
+    void *f_scr = nullptr, *f_xq = nullptr, *f_ha = nullptr, *i8x = nullptr;
+    int32_t *f_slot = nullptr, *f_src = nullptr;
+    // the prompt's MMQ experts (a build with llama.cpp's MMQ only)
     bool use_mmq = false;
     std::unique_ptr<MMQ::Context> mctx;
     int32_t *rcnt = nullptr, *rcur = nullptr, *rbounds = nullptr, *rmax = nullptr, *ident = nullptr, *rinv = nullptr;
@@ -1645,21 +1668,61 @@ struct Stage {
         att_p16 = dalloc_t<__half>(kAttScoreFloats);
         k16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
         v16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
-        use_mmq = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr;
-        auto mmq_ok = [&](const Layer& L) {
-            return MMQ::supported(L.L.gu_type) && MMQ::supported(L.L.d_type) && MMQ::fits(L.L.gu_type, 2 * g.n_ff) &&
-                   MMQ::fits(L.L.d_type, g.n_embd);
-        };
-        for (const Layer& L : m->layers) use_mmq = use_mmq && mmq_ok(L);
-        if (m->has_mtp) use_mmq = use_mmq && mmq_ok(m->mtp);
-        if (use_mmq) {
-            mctx = std::make_unique<MMQ::Context>();
-            rcnt = dalloc_t<int32_t>((size_t) g.n_expert);
-            rcur = dalloc_t<int32_t>((size_t) g.n_expert);
-            rbounds = dalloc_t<int32_t>((size_t) g.n_expert + 1);
-            rmax = dalloc_t<int32_t>(1);
+        {
+            const bool mmq_avail = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr;
+            auto mmq_ok = [&](const Layer& L) {
+                return MMQ::supported(L.L.gu_type) && MMQ::supported(L.L.d_type) && MMQ::fits(L.L.gu_type, 2 * g.n_ff) &&
+                       MMQ::fits(L.L.d_type, g.n_embd);
+            };
+            const size_t n_state = m->layers.size() + 1;
+            fused_on.assign(n_state, 0);
+            i8_on.assign(n_state, 0);
+            if (g.n_embd == FQ::kQ36Embd && g.n_ff == FQ::kQ36FF)
+                for (size_t i = 0; i < n_state; ++i)
+                    if (mine(i) && (i < m->layers.size() || m->has_mtp)) {
+                        const Layer& L = layer_at((int) i);
+                        fused_on[i] = FQ::native_layer_ext(L.L.gu_type, L.L.d_type) ? 1 : 0;
+                    }
+            // the route of each layer: fused > our int8 kernels (STRATA_EXPERT_I8=1) > MMQ > our int8 kernels > the grouped kernels.
+            // A build without MMQ reads an unset STRATA_EXPERT_I8 as 1 (the kernel library is told here, as upstream's engine does)
+            const bool mmq_free = !MMQ::built();
+            if (mmq_free) K::native_expert_i8_set_mmq_free();
+            const int i8_raw = K::i8_switch_parse(std::getenv("STRATA_EXPERT_I8"));
+            i8_few = K::native_expert_i8_few_rows_limit();
+            bool any_mmq = false;
+            int n_mine = 0, n_grouped = 0;
+            for (size_t i = 0; i < n_state; ++i) {
+                if (!mine(i) || (i == m->layers.size() && !m->has_mtp)) continue;
+                const Layer& Li = layer_at((int) i);
+                const bool mmq_takes = !fused_on[i] && mmq_avail && mmq_ok(Li);
+                const K::Q36Route r = K::q36_layer_route(fused_on[i] != 0, i8_raw, mmq_free, mmq_takes,
+                                                         !fused_on[i] && K::native_expert_i8_supported(Li.L));
+                i8_on[i] = r == K::Q36Route::Int8 ? 1 : 0;
+                n_grouped += r == K::Q36Route::Grouped ? 1 : 0;
+                any_mmq = any_mmq || r == K::Q36Route::Mmq;
+                n_fused += fused_on[i] ? 1 : 0;
+                n_i8 += (size_t) i8_on[i];
+                ++n_mine;
+            }
+            use_pf = K::q36_prompt_path_ok(n_mine, n_grouped);
+            if (!use_pf) {   // a layer has no route faster than the grouped kernels: every prompt chunk on them, as before
+                std::fill(fused_on.begin(), fused_on.end(), 0);
+                std::fill(i8_on.begin(), i8_on.end(), 0);
+                n_fused = n_i8 = 0;
+                any_mmq = false;
+            }
+            use_mmq = use_pf && any_mmq;
+            if (use_pf) {
+                rcnt = dalloc_t<int32_t>((size_t) g.n_expert);
+                rcur = dalloc_t<int32_t>((size_t) g.n_expert);
+                rbounds = dalloc_t<int32_t>((size_t) g.n_expert + 1);
+                rmax = dalloc_t<int32_t>(1);
+            }
+            if (use_mmq) mctx = std::make_unique<MMQ::Context>();
+            const int n_mmq = n_mine - (int) n_fused - (int) n_i8 - n_grouped;
+            std::fprintf(stderr, "strata-q36: CUDA%d: prompt experts: %zu of %d layers on the fused int8 kernels, %zu on our int8 kernels, "
+                         "%d on MMQ, %d on the native grouped kernels\n", dev_, n_fused, n_mine, n_i8, n_mmq, n_grouped);
         }
-        if (first) std::fprintf(stderr, "strata-q36: prompt experts on %s\n", use_mmq ? "MMQ (int8)" : "the native grouped kernels");
         {
             std::string gerr;
             int64_t big = 0;
@@ -1793,12 +1856,27 @@ struct Stage {
         r.x16 = ralloc_t<__half>(T * (size_t) max_in);
         r.sk_part = ralloc((size_t) kSplitK * T * (g.n_expert + 1));
         r.q16 = ralloc_t<__half>(T * g.n_head * g.head_dim);
+        if (use_pf) {
+            const int64_t ne = (int64_t) T * Kp;
+            r.rinv = ralloc_t<int32_t>((size_t) ne);
+            if (n_fused > 0) {
+                r.f_scr = rallocb(PF::group_bytes(ne, (int) g.n_expert));
+                r.f_xq = rallocb(PF::act_bytes((int64_t) T, g.n_embd));
+                r.f_ha = rallocb(PF::act_bytes(ne, g.n_ff));
+                r.f_slot = ralloc_t<int32_t>((size_t) ne);
+                r.f_src = ralloc_t<int32_t>((size_t) ne);
+            }
+            if (n_i8 > 0) r.i8x = rallocb(K::native_q8_1_bytes((int) N, 1) * T);
+        }
         if (use_mmq) {
             const int64_t ne = (int64_t) T * Kp;
-            r.ident = ralloc_t<int32_t>((size_t) ne);
-            r.rinv = ralloc_t<int32_t>((size_t) ne);
+            // the row table is read past its end by llama.cpp's MMQ (a whole J-column tile, and the stream-k fixup up to
+            // roundup(max_rows, J) from an expert's first row): mmq_ids_table_rows adds that margin (upstream a041fd038)
+            const int64_t ids_rows = (int64_t) MMQ::mmq_ids_table_rows((uint64_t) ne, (uint64_t) T);
+            if (ids_rows <= 0) { std::fprintf(stderr, "strata-q36: the MMQ row table does not fit\n"); std::exit(1); }
+            r.ident = ralloc_t<int32_t>((size_t) ids_rows);
             CK(cudaDeviceSynchronize());   // ident's cudaMemset (legacy stream) before the iota on the non-blocking stream
-            MMQ::iota(r.ident, ne, st);
+            MMQ::iota(r.ident, ids_rows, st);
             r.mq_x = rallocb(MMQ::q8_bytes(ne, g.n_embd));
             r.mq_hq = rallocb(MMQ::q8_bytes(ne, g.n_ff));
             r.mq_gu = ralloc((size_t) ne * 2 * FF);
@@ -1831,7 +1909,8 @@ struct Stage {
                         (void*) r.mtp_cat, (void*) r.hmtp, (void*) r.att_m, (void*) r.att_l, (void*) r.att_alpha,
                         (void*) r.att_part, (void*) r.mq_gu, (void*) r.mq_h, r.q8, r.xq, r.escr, r.mq_x, r.mq_hq,
                         (void*) r.x16, (void*) r.q16, (void*) r.att_qg, (void*) r.ids, (void*) r.grp_start, (void*) r.n_groups,
-                        (void*) r.ent_dst, (void*) r.ent_tok, (void*) r.tok, (void*) r.ident, (void*) r.rinv, (void*) r.grp_ptr})
+                        (void*) r.ent_dst, (void*) r.ent_tok, (void*) r.tok, (void*) r.ident, (void*) r.rinv, (void*) r.grp_ptr,
+                        r.f_scr, r.f_xq, r.f_ha, r.i8x, (void*) r.f_slot, (void*) r.f_src})
             if (p && !r.carved) CK(cudaFree(p));
         r = RowSet();
     }
@@ -1845,6 +1924,7 @@ struct Stage {
         mtp_cat = r.mtp_cat; hmtp = r.hmtp; att_tq_chunk = r.att_tq_chunk; att_m = r.att_m; att_l = r.att_l;
         att_alpha = r.att_alpha; att_part = r.att_part; att_qg = r.att_qg; ident = r.ident; rinv = r.rinv; mq_x = r.mq_x;
         mq_hq = r.mq_hq; mq_gu = r.mq_gu; mq_h = r.mq_h;
+        f_scr = r.f_scr; f_xq = r.f_xq; f_ha = r.f_ha; i8x = r.i8x; f_slot = r.f_slot; f_src = r.f_src;
     }
     /// The streaming buffers of a hybrid stage's prompt chunks (two whole layers of experts).
     void alloc_staging() {
@@ -2433,37 +2513,80 @@ struct Stage {
         if (hy_rows) {
             route_to_host(T);
             resident_experts(L, li, T);
-        } else if (T > kGemmT && use_mmq) {
-            // a prompt chunk: the experts on llama.cpp's MMQ (int8, the weights read once per expert): the entries
-            // sorted by expert on the device, gate+up as one [2 FF] product per expert, SwiGLU, down into rows the
-            // combine reads through entry -> sorted row
+        } else if (T > kGemmT && use_pf) {
+            // a prompt chunk: each expert's weights read once for all its rows, on Strata's fused int8 kernels where they
+            // cover the layer (fused_on), else our int8 kernels (i8_on), else llama.cpp's MMQ (a build with it).  In the
+            // hybrid mode the layer's experts come streamed (stream_take); the routing counts feed the slots' scores there
             const int ne = (int) g.n_expert;
-            CK(cudaMemsetAsync(rcnt, 0, (size_t) ne * 4, st));
-            k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, rcnt);
-            k_route_scan<<<1, 32, 0, st>>>(rcnt, ne, rbounds, rcur, rmax);
-            k_route_scatter<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, Kp, rcur, ent_dst, ent_tok, rinv);
-            CK(cudaMemcpyAsync(hpin + 10, rmax, 4, cudaMemcpyDeviceToHost, st));
+            const bool fz = fused_on[li] != 0;
+            const bool i8l = i8_on[li] != 0;   // our int8 kernels (no sorted-row tables: they collect their own groups)
+            const bool mql = !fz && !i8l;       // MMQ
+            int64_t maxr = 0;
+            if (mql || lhy(li)) {
+                CK(cudaMemsetAsync(rcnt, 0, (size_t) ne * 4, st));
+                k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, rcnt);
+            }
+            if (mql) {
+                // MMQ: the entries sorted by expert on the device, gate+up as one [2 FF] product per expert, SwiGLU, down
+                // into rows the combine reads through entry -> sorted row
+                k_route_scan<<<1, 32, 0, st>>>(rcnt, ne, rbounds, rcur, rmax);
+                k_route_scatter<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, Kp, rcur, ent_dst, ent_tok, rinv);
+                CK(cudaMemcpyAsync(hpin + 10, rmax, 4, cudaMemcpyDeviceToHost, st));
+            }
             if (lhy(li)) CK(cudaMemcpyAsync(h_cnt + li * g.n_expert, rcnt, (size_t) ne * 4, cudaMemcpyDeviceToHost, st));
-            CK(cudaStreamSynchronize(st));
-            if (lhy(li))
-                for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
-            const int64_t maxr = hpin[10];
+            if (mql || lhy(li)) {
+                CK(cudaStreamSynchronize(st));
+                if (lhy(li))
+                    for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
+                maxr = hpin[10];
+            }
             const uint8_t* wbase = lhy(li) ? stream_take((int) li) : L.blobs;
-            MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
-            MMQ::Product gu;
-            gu.w = wbase; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
-            gu.n = ne; gu.xq = mq_x; gu.bounds = rbounds; gu.ids = ident; gu.total_rows = n_ent; gu.max_rows = maxr;
-            gu.dst = mq_gu; gu.ld_dst = 2 * FF;
-            mctx->run(gu, st);
-            MMQ::swiglu(mq_gu, mq_h, n_ent, FF, false, st);
-            MMQ::quantize(mq_h, nullptr, mq_hq, L.L.d_type, FF, FF, n_ent, st);
-            MMQ::Product dn;
-            dn.w = wbase + L.L.down_off; dn.type = L.L.d_type; dn.w_rows = N; dn.w_cols = FF;
-            dn.expert_bytes = L.stride; dn.n = ne; dn.xq = mq_hq; dn.bounds = rbounds; dn.ids = ident;
-            dn.total_rows = n_ent; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
-            mctx->run(dn, st);
+            if (fz) {
+                // the layer's input to int8 once per token, the rows of each expert grouped on the device (no host wait),
+                // then per batch of experts gate/up + SwiGLU + H to int8 + down into the entries' rows (f_slot)
+                FQ::quantize_act_native(h, T, N, f_xq, st);
+                PF::group(ids, n_ent, Kp, ne, f_scr, f_slot, f_src, st);
+                const FQ::NativeGeom ng{L.L.gu_type, L.L.d_type, L.L.gu_row, L.L.d_row, L.L.up_off, L.L.down_off};
+                for (int e = 0; e < ne; e += FQ::kQ36MaxBatch) {
+                    FQ::Batch b;
+                    b.e0 = e;
+                    b.e1 = std::min(ne, e + FQ::kQ36MaxBatch);
+                    for (int x = b.e0; x < b.e1; ++x) b.blob[x - b.e0] = wbase + (size_t) x * L.stride;
+                    FQ::experts_native_ext(b, ng, ne, n_ent, f_scr, f_xq, f_src, f_ha, eparts, st);
+                }
+                prow = f_slot;
+            } else if (i8l) {
+                // our int8 expert kernels: the layer's rows quantized once, the groups per expert (blobs from wbase: the
+                // streamed buffer in the hybrid mode), gate/up + SwiGLU + H to int8 and the down rows into eparts by entry
+                // (prow stays null, as the grouped kernels).  A chunk whose experts average few rows takes the grouped kernels.
+                k_group<<<1, kThreads, 0, st>>>(ids, (int) n_ent, Kp, (int) g.n_expert, wbase, L.stride, grp_ptr, grp_start,
+                                                n_groups, ent_dst, ent_tok);
+                if (K::q36_i8_chunk_takes(n_ent, ne, i8_few)) {
+                    K::native_expert_i8_quantize(h, T, N, i8x, st);
+                    K::native_expert_i8(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, std::min<int64_t>(n_ent, g.n_expert),
+                                        n_ent, i8x, escr, eparts, st);
+                } else {
+                    quant(h, N, T, xq);
+                    K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
+                                             std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st);
+                }
+            } else {
+                MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
+                MMQ::Product gu;
+                gu.w = wbase; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
+                gu.n = ne; gu.xq = mq_x; gu.bounds = rbounds; gu.ids = ident; gu.total_rows = n_ent; gu.max_rows = maxr;
+                gu.dst = mq_gu; gu.ld_dst = 2 * FF;
+                mctx->run(gu, st);
+                MMQ::swiglu(mq_gu, mq_h, n_ent, FF, false, st);
+                MMQ::quantize(mq_h, nullptr, mq_hq, L.L.d_type, FF, FF, n_ent, st);
+                MMQ::Product dn;
+                dn.w = wbase + L.L.down_off; dn.type = L.L.d_type; dn.w_rows = N; dn.w_cols = FF;
+                dn.expert_bytes = L.stride; dn.n = ne; dn.xq = mq_hq; dn.bounds = rbounds; dn.ids = ident;
+                dn.total_rows = n_ent; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
+                mctx->run(dn, st);
+                prow = rinv;
+            }
             if (lhy(li)) stream_done();
-            prow = rinv;
         } else {
             grouped_experts(L, T);
         }
@@ -2697,7 +2820,7 @@ struct Engine {
         return last();
     }
     bool lhy(size_t li) { return stage_of(li).lhy(li); }
-    bool use_mmq() { return first().use_mmq; }
+    bool use_pf() { return first().use_pf; }
     long long hy_cpu() { long long n = 0; for (auto& s : stg) n += s->hy_cpu; return n; }
     long long hy_gpu() { long long n = 0; for (auto& s : stg) n += s->hy_gpu; return n; }
     long long hy_swaps() { long long n = 0; for (auto& s : stg) n += s->hy_swaps; return n; }
@@ -2758,7 +2881,7 @@ struct Engine {
         for (size_t i = 0; i < stg.size(); ++i) {
             Stage& s = *stg[i];
             OnDevice od(s.dev);
-            if (s.main_hybrid && T > s.hybrid_t && s.use_mmq) {
+            if (s.main_hybrid && T > s.hybrid_t && s.use_pf) {
                 std::vector<int> seq;
                 for (int l = s.lb; l < s.le; ++l)
                     if (s.lhy((size_t) l)) seq.push_back(l);
@@ -2854,7 +2977,7 @@ struct Engine {
         OnDevice od(s.dev);
         const int N = (int) m->g.n_embd;
         const size_t li = m->layers.size();
-        if (s.main_hybrid && s.lhy(li) && T > s.hybrid_t && s.use_mmq) s.stream_begin({(int) li});
+        if (s.main_hybrid && s.lhy(li) && T > s.hybrid_t && s.use_pf) s.stream_begin({(int) li});
         s.embed_dev(T, s.y);
         k_rms_ld<<<T, kThreads, 0, s.st>>>(s.y, N, m->mtp_enorm, s.mtp_cat, 2 * N, N, m->eps);              // [e | ...]
         k_rms_ld<<<T, kThreads, 0, s.st>>>(seeds, N, m->mtp_hnorm, s.mtp_cat + N, 2 * N, N, m->eps);      // [... | h]
@@ -3463,7 +3586,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (E.main_hybrid) E.use_graph = false;   // the host takes part in every layer
     E.mtp_graph = !E.lhy(m.layers.size());    // (the MTP block's layer resident: its draft step may still be a graph)
     E.hybrid_t = std::max(1, std::min(hybrid_t, E.tmax));
-    if (!E.use_mmq()) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
+    if (!E.use_pf()) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
     // host memory: every expert of every hybrid layer (an mtp_only stage: the MTP block's), pinned where the driver
     // allows it (the prompt's stream and the slot copies), portable so that every card's copy engine reads it
     size_t host = 0;
@@ -3506,7 +3629,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         s.hyT = s.main_hybrid ? std::max(E.hybrid_t, Stage::kVerify) : E.tmax;   // every batch is a hybrid batch when only the MTP block is
         // elastic: the prompt chunk's buffers and the streaming buffers only while a streamed prompt runs, their VRAM
         // holds extra slots otherwise (STRATA_Q36_NO_ELASTIC=1, --expert-slots or --expert-vram: as placed, always)
-        s.elastic = s.main_hybrid && s.use_mmq && slots <= 0 && vram_gib < 0 && std::getenv("STRATA_Q36_NO_ELASTIC") == nullptr;
+        s.elastic = s.main_hybrid && s.use_pf && slots <= 0 && vram_gib < 0 && std::getenv("STRATA_Q36_NO_ELASTIC") == nullptr;
         s.max_layer_bytes = P.max_layer;
         if (s.elastic) {   // the small set is allocated now so that the base slots leave room for it
             s.alloc_rows(s.rows_small, (size_t) s.hyT);
@@ -3515,7 +3638,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             P.fr = fr;
             P.budget = fr > reserve ? fr - reserve : 0;
         }
-        const size_t staging = s.use_mmq && E.main_hybrid && !P.mtp_only ? 2 * (P.max_layer + kMmqTail) : 0;
+        const size_t staging = s.use_pf && E.main_hybrid && !P.mtp_only ? 2 * (P.max_layer + kMmqTail) : 0;
         size_t slot_bytes = P.budget > staging ? P.budget - staging : 0;
         if (slot_bytes + staging + ((size_t) 256 << 20) > P.fr)
             slot_bytes = P.fr > staging + ((size_t) 512 << 20) ? P.fr - staging - ((size_t) 512 << 20) : 0;
@@ -3935,6 +4058,29 @@ int strata::qwen35::run(int argc, char** argv) {
     if (std::getenv("STRATA_MMQ_KQ") == nullptr) _putenv_s("STRATA_MMQ_KQ", "1");
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) _putenv_s("CUDA_MODULE_LOADING", "EAGER");
 #endif
+    // Strata's fused prompt kernels for this family's formats (moe_fused_iq_q36.cu): the K-quant, Q6_K and Q8_0 gate/up
+    // instances are opt-in for Flash-Next's packs; this engine sets them up by default (=0 keeps a format off them), and in a
+    // build without MMQ the Turing set-up too (own_only_switches.hpp, q36_entry_switches: the same switches on both entries)
+    for (const char* v : strata::prefill::q36_entry_switches(MMQ::built())) {
+#if !defined(_WIN32)
+        setenv(v, "1", 0);
+#else
+        if (std::getenv(v) == nullptr) _putenv_s(v, "1");
+#endif
+    }
+    // a build without llama.cpp's MMQ (0.2.16 on) has no MMQ tile for any layer: a layer takes the fused kernels, our int8
+    // kernels or the grouped kernels.  `strata` sets STRATA_PF_FUSED=1 before main in such a build (prefill.cpp); the
+    // standalone strata-q36 does not link that code, so it does the same here.  A value you set is kept.
+    {
+        const int pf_now = strata::prefill::fused_tile::pf_env(std::getenv("STRATA_PF_FUSED"));
+        if (pf_now < 0 && strata::prefill::fused_tile::q36_start_env(MMQ::built(), pf_now) == 1) {
+#if !defined(_WIN32)
+            setenv("STRATA_PF_FUSED", "1", 1);
+#else
+            _putenv_s("STRATA_PF_FUSED", "1");
+#endif
+        }
+    }
     // the visible cards: the first runs the first layers (and the whole model on its own); the packed Q8_0 decode
     // copies (a second copy of the eligible dense matrices, 1.8 GiB on Qwen3.6) only where the first card has room
     // for them (20 GB or more) unless STRATA_Q8_PACKED says otherwise; a small card (under 12 GB) takes the smaller
